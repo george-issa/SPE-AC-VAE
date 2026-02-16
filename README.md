@@ -9,7 +9,7 @@ Extracting real-frequency spectral functions A(ω) from imaginary-time Green's f
 ## Model Architecture
 
 - **Encoder**: Convolutional layers (Conv1d) followed by fully connected layers, mapping G(τ) → latent mean and variance
-- **Latent space**: 14-dimensional (4 × NUM_POLES − 2)
+- **Latent space**: L-dimensional (L = 4 × NUM_POLES − 2)
 - **Decoder**: Fully connected layers producing complex poles and residues
 - **Physics layer**: Reconstructs G(τ) from poles/residues via Gauss-Legendre quadrature
 
@@ -60,7 +60,7 @@ Or fine-tune a pretrained model separately:
 python pretrain/run_finetune.py
 ```
 
-## Default Parameters
+## Example/Default Parameters
 
 | Parameter | Value |
 |-----------|-------|
