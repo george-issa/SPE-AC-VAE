@@ -1,1 +1,3 @@
-.DS_Store
+*.DS_Store
+pretrain/__pycache__
+pretrain/.DS_Store
