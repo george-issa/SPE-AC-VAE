@@ -79,7 +79,7 @@ MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
 
 # --- Model (must match pretraining) ---
 LOAD_PRETRAIN = False
-NUM_POLES = 4
+NUM_POLES = 6
 BETA = 10.0
 DTAU = 0.05
 INPUT_DIM = int(BETA / DTAU)        # Must match the dimension of the input Green's function
@@ -143,8 +143,8 @@ SMOOTHNESS_NW = 500
 SMOOTHNESS_WMIN = -8.0
 SMOOTHNESS_WMAX = 8.0
 
-# Reproducibility
-SEED = 42
+# Reproducibility — set to an integer (e.g. 42) for deterministic runs, or None to disable
+SEED = None
 
 
 # ==========================================================================
@@ -161,9 +161,10 @@ def set_seed(seed):
 
 
 def main():
-    set_seed(SEED)
+    if SEED is not None:
+        set_seed(SEED)
     print(f"Device: {DEVICE}")
-    print(f"Seed: {SEED}")
+    print(f"Seed: {SEED if SEED is not None else 'disabled (random)'}")
     print(f"Model version: {MODEL_VERSION}")
     print(f"Model: NUM_POLES={NUM_POLES}, INPUT_DIM={INPUT_DIM}")
 
@@ -244,8 +245,10 @@ def main():
     # --- Load full dataset — train on all samples, no held-out split ---
     print(f"Loading dataset from: {DATA_PATH}")
     ft_dataset = GreenFunctionDataset(file_path=DATA_PATH)
-    _g = torch.Generator()
-    _g.manual_seed(SEED)
+    _g = None
+    if SEED is not None:
+        _g = torch.Generator()
+        _g.manual_seed(SEED)
     train_loader = DataLoader(ft_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, generator=_g)
     val_loader = train_loader  # Same data; ReduceLROnPlateau monitors eval-mode training loss
     print(f"  Full dataset: {len(ft_dataset)} samples, {len(train_loader)} batches/epoch")
