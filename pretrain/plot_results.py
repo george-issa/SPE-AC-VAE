@@ -15,6 +15,7 @@ Usage:
 
 import os
 import sys
+import json
 import argparse
 import numpy as np
 import torch
@@ -54,10 +55,77 @@ COLORS = {
 
 
 # ---------------------------------------------------------------------------
+# Parameter annotation helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_val(v):
+    """Format a loss weight for display: 0 → OFF, small/large → sci notation."""
+    if v == 0:
+        return "OFF"
+    if abs(v) < 0.01 or abs(v) >= 1000:
+        return f"{v:.1e}"
+    return f"{v:g}"
+
+
+def _build_loss_annotation(fig, params):
+    """Add two text lines to the figure bottom: run identity and loss weights."""
+    def tex(s):
+        return str(s).replace("_", r"\_")
+
+    # --- Line 1: run identity ---
+    parts = []
+    if params.get("sID"):
+        parts.append(rf"\texttt{{{tex(params['sID'])}}}")
+    if params.get("MODEL_VERSION"):
+        parts.append(rf"model~v{tex(params['MODEL_VERSION'])}")
+    if params.get("NUM_POLES"):
+        parts.append(rf"{params['NUM_POLES']}~poles")
+    if params.get("SPECTRAL_TYPE"):
+        s = tex(params["SPECTRAL_TYPE"])
+        ns = params.get("NOISE_S")
+        noise_str = rf",~$s={ns:.0e}$" if isinstance(ns, float) else ""
+        parts.append(rf"{s}{noise_str}")
+    lr = params.get("FINETUNE_LR", params.get("PRETRAIN_LR"))
+    if lr is not None:
+        parts.append(rf"LR$={_fmt_val(lr)}$")
+    if params.get("FINETUNE_EPOCHS"):
+        parts.append(rf"{params['FINETUNE_EPOCHS']}~ep")
+    if params.get("BATCH_SIZE"):
+        parts.append(rf"batch~{params['BATCH_SIZE']}")
+    line1 = r"~$|$~".join(parts)
+
+    # --- Line 2: active vs inactive losses ---
+    loss_defs = [
+        (r"\lambda_{\chi^2}",        params.get("LAMBDA_CHI2",  1.0)),
+        (r"\alpha_\mathrm{KL}",      params.get("ALPHA_KL",     0.0)),
+        (r"\eta_0",                  params.get("ETA0",          0.0)),
+        (r"\eta_2",                  params.get("ETA2",          0.0)),
+        (r"\eta_4",                  params.get("ETA4",          0.0)),
+        (r"\lambda_\mathrm{smooth}", params.get("LAMBDA_SMOOTH", 0.0)),
+        (r"\lambda_\mathrm{pos}",    params.get("LAMBDA_POS",    0.0)),
+    ]
+    active, inactive = [], []
+    for label, val in loss_defs:
+        if val > 0:
+            active.append(rf"${label}={_fmt_val(val)}$")
+        else:
+            inactive.append(rf"${label}$")
+
+    off_str = r"~$|$~".join(inactive) if inactive else r"none"
+    line2 = (
+        r"\textbf{Active:}~" + r"~$|$~".join(active)
+        + r"~~~\textbf{Off:}~" + off_str
+    )
+
+    fig.text(0.5, -0.02, line1, ha="center", fontsize=9, style="italic")
+    fig.text(0.5, -0.06, line2, ha="center", fontsize=9)
+
+
+# ---------------------------------------------------------------------------
 # G(tau) comparison plots
 # ---------------------------------------------------------------------------
 
-def plot_gtau_comparison(G_input, G_recon, beta, n_samples=6, save_path=None):
+def plot_gtau_comparison(G_input, G_recon, beta, n_samples=6, noise_var=None, save_path=None):
     """Plot G(tau) input vs reconstructed for selected samples.
 
     Parameters
@@ -84,7 +152,11 @@ def plot_gtau_comparison(G_input, G_recon, beta, n_samples=6, save_path=None):
         ax.plot(taus, G_input[i], "o", color=COLORS["input"], markersize=2, alpha=0.6, label="Input")
         ax.plot(taus, G_recon[i], "-", color=COLORS["recon"], linewidth=1.5, label="Reconstructed")
         mse = np.mean((G_input[i] - G_recon[i]) ** 2)
-        ax.set_title(f"Sample {i+1}  (MSE={mse:.2e})")
+        if noise_var is not None:
+            chi2_est = mse / noise_var
+            ax.set_title(rf"Sample {i+1}  (MSE$={mse:.2e}$,  $\hat{{\chi}}^2\approx{chi2_est:.2f}$)")
+        else:
+            ax.set_title(rf"Sample {i+1}  (MSE$={mse:.2e}$)")
         ax.set_xlabel(r"$\tau$")
         ax.set_ylabel(r"$G(\tau)$")
         ax.legend(loc="upper right")
@@ -94,6 +166,12 @@ def plot_gtau_comparison(G_input, G_recon, beta, n_samples=6, save_path=None):
         axes[i // cols, i % cols].set_visible(False)
 
     fig.suptitle(r"$G(\tau)$ Reconstruction", fontsize=16, y=1.02)
+    note = (
+        r"MSE $= \frac{1}{L_\tau}\sum_\tau(G_\mathrm{recon}-G_\mathrm{data})^2$"
+        r"$\quad\hat{\chi}^2 = \mathrm{MSE}/\bar{\sigma}^2$"
+        r"$\quad$ at $\chi^2\!\to\!1$: MSE $\to\bar{\sigma}^2$ (noise variance)"
+    )
+    fig.text(0.5, -0.01, note, ha="center", fontsize=9, style="italic")
     plt.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
@@ -181,7 +259,7 @@ def plot_spectral_comparison(poles, residues, mu_targets, sigma_targets,
 # Loss curves
 # ---------------------------------------------------------------------------
 
-def plot_loss_curves(loss_dir, tag="pretrain", save_path=None):
+def plot_loss_curves(loss_dir, tag="pretrain", save_path=None, params=None):
     """Plot training and validation loss curves with all components.
 
     Handles both pretrain losses (chi2, spec, smooth, kl) and
@@ -192,7 +270,15 @@ def plot_loss_curves(loss_dir, tag="pretrain", save_path=None):
     loss_dir  : str, directory containing .npy loss files
     tag       : str, loss file tag
     save_path : str or None
+    params    : dict or None — run config for annotation; auto-loaded from
+                params.json in parent of loss_dir if not provided
     """
+    # Auto-load params from the output directory if not passed explicitly
+    if params is None:
+        candidate = os.path.join(os.path.dirname(loss_dir), "params.json")
+        if os.path.exists(candidate):
+            with open(candidate) as _f:
+                params = json.load(_f)
     # Try loading all possible loss files
     possible_files = {
         "train": f"train_losses_{tag}.npy",
@@ -201,6 +287,7 @@ def plot_loss_curves(loss_dir, tag="pretrain", save_path=None):
         "spec": f"spec_losses_{tag}.npy",
         "smooth": f"smooth_losses_{tag}.npy",
         "kl": f"kl_losses_{tag}.npy",
+        "moment": f"moment_losses_{tag}.npy",
         "recon": f"recon_losses_{tag}.npy",
         "pos": f"pos_losses_{tag}.npy",
         "neg_green": f"neg_green_losses_{tag}.npy",
@@ -225,9 +312,9 @@ def plot_loss_curves(loss_dir, tag="pretrain", save_path=None):
         fig = plt.figure(figsize=(22, 8))
         gs = GridSpec(2, 4, figure=fig, hspace=0.35, wspace=0.3)
     else:
-        # Pretrain layout: 2x2 grid
-        fig = plt.figure(figsize=(14, 8))
-        gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.3)
+        # Pretrain layout: 2x3 grid (to accommodate moment loss)
+        fig = plt.figure(figsize=(20, 8))
+        gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.3)
 
     # Top-left: Total train/val loss
     ax1 = fig.add_subplot(gs[0, 0])
@@ -317,8 +404,8 @@ def plot_loss_curves(loss_dir, tag="pretrain", save_path=None):
         ax6.grid(True, alpha=0.3)
 
     else:
-        # Pretrain layout (no penalties)
-        # Top-right or Bottom-left: Spectral MSE
+        # Pretrain layout (no penalties): 2x3 grid
+        # Bottom-left: Spectral MSE
         ax3 = fig.add_subplot(gs[1, 0])
         if "spec" in losses:
             ax3.semilogy(losses["spec"], label="Spectral MSE", color="#388E3C", linewidth=1.5)
@@ -328,7 +415,7 @@ def plot_loss_curves(loss_dir, tag="pretrain", save_path=None):
         ax3.legend()
         ax3.grid(True, alpha=0.3)
 
-        # Bottom-right: Smoothness and KL
+        # Bottom-middle: Smoothness and KL
         ax4 = fig.add_subplot(gs[1, 1])
         if "smooth" in losses:
             ax4.semilogy(losses["smooth"], label="Smoothness", color="#F57C00", linewidth=1.5)
@@ -341,7 +428,30 @@ def plot_loss_curves(loss_dir, tag="pretrain", save_path=None):
         ax4.legend()
         ax4.grid(True, alpha=0.3)
 
+        # Top-right (0,2): Chi-squared (already plotted in ax2 for col 1; reuse col 2 top for chi2 detail)
+        ax5 = fig.add_subplot(gs[0, 2])
+        if "chi2" in losses:
+            ax5.semilogy(losses["chi2"], label=r"$\chi^2$", color="#7B1FA2", linewidth=1.5)
+        ax5.set_xlabel("Epoch")
+        ax5.set_title(r"$\chi^2$ detail")
+        ax5.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5, label="Ideal")
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
+
+        # Bottom-right: Moment loss
+        ax6 = fig.add_subplot(gs[1, 2])
+        if "moment" in losses:
+            ax6.semilogy(np.maximum(losses["moment"], 1e-10), label="Moment loss",
+                         color="#E91E63", linewidth=1.5)
+        ax6.set_xlabel("Epoch")
+        ax6.set_ylabel("Loss")
+        ax6.set_title(r"Spectral Moment Loss ($M_1$, $M_2$)")
+        ax6.legend()
+        ax6.grid(True, alpha=0.3)
+
     fig.suptitle(f"Training Curves ({tag})", fontsize=16, y=1.01)
+    if params is not None:
+        _build_loss_annotation(fig, params)
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
         print(f"Saved: {save_path}")
@@ -411,7 +521,7 @@ def plot_poles_residues(poles, residues, n_samples=6, save_path=None):
 # ---------------------------------------------------------------------------
 
 def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
-                            n_samples=6, wmin=-6, wmax=6, Nw=1000, save_path=None):
+                            n_samples=6, wmin=-8, wmax=8, Nw=1000, save_path=None):
     """Plot predicted A(omega) from poles/residues for selected samples,
     overlaid with ground truth if available.
 
@@ -455,7 +565,7 @@ def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
                     label="Input (exact)")
 
         ax.plot(omegas_np, A_pred[i], "-", color=COLORS["pred"], linewidth=1.5,
-                label="Predicted")
+                label=r"Predicted ($z = \mu$)")
 
         # Mark pole positions
         eps = poles[i].real.numpy()
@@ -472,7 +582,13 @@ def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
     for i in range(n_samples, rows * cols):
         axes[i // cols, i % cols].set_visible(False)
 
-    fig.suptitle(r"Predicted Spectral Function $A(\omega)$", fontsize=16, y=1.02)
+    fig.suptitle(
+        r"Predicted $A(\omega) = -\frac{1}{\pi}\sum_p \mathrm{Im}"
+        r"\!\left(\frac{r_p}{\omega - s_p}\right)$"
+        "\n"
+        r"Deterministic $z = \mu$; dashed verticals: pole positions $\epsilon_p$",
+        fontsize=13, y=1.04,
+    )
     plt.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
@@ -481,7 +597,7 @@ def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
 
 
 def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
-                          wmin=-6, wmax=6, Nw=1000, save_path=None):
+                          wmin=-8, wmax=8, Nw=1000, save_path=None):
     """Plot the average predicted A(omega) with ground truth overlay and difference.
 
     Two panels:
@@ -533,9 +649,10 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
                  label="Input (exact)")
 
     ax1.plot(omegas_np, A_mean, "-", color=COLORS["pred"], linewidth=2,
-             label=r"$\langle A(\omega) \rangle$ predicted")
+             label=r"$\langle A(\omega) \rangle$ (mean over dataset)")
     ax1.fill_between(omegas_np, A_mean - A_std, A_mean + A_std,
-                     alpha=0.2, color=COLORS["pred"], label=r"$\pm 1\sigma$")
+                     alpha=0.2, color=COLORS["pred"],
+                     label=r"$\pm 1\sigma$ (variation across dataset samples)")
 
     for p in range(len(eps_mean)):
         ax1.axvline(eps_mean[p], color=COLORS["pole_re"], linestyle="--",
@@ -543,7 +660,7 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
                     label=rf"$\langle \epsilon_{p+1} \rangle = {eps_mean[p]:.2f}$")
 
     ax1.set_ylabel(r"$A(\omega)$")
-    ax1.set_title(r"Spectral Function Comparison")
+    ax1.set_title(r"Dataset-averaged $A(\omega)$: $\langle\cdot\rangle$ and $\pm 1\sigma$ over all samples")
     ax1.set_xlim(wmin, wmax)
     ax1.legend()
     ax1.grid(True, alpha=0.3)
@@ -622,6 +739,74 @@ def plot_pretrain_eval(eval_file, output_dir=None):
     print(f"\nAll plots saved to {output_dir}/")
 
 
+def plot_spectral_mc(A_mean, A_std, omega_eval_grid, A_input=None, omega_input=None,
+                     n_mc=None, save_path=None):
+    """Plot MC mean ± 1σ spectral function with optional ground truth overlay.
+
+    Parameters
+    ----------
+    A_mean         : ndarray (N_test, Nw), mean A(omega) across MC samples
+    A_std          : ndarray (N_test, Nw), std A(omega) across MC samples
+    omega_eval_grid: ndarray (Nw,)
+    A_input        : ndarray (N_omega,) or None, ground truth
+    omega_input    : ndarray (N_omega,) or None
+    save_path      : str or None
+    """
+    A_mean_avg = A_mean.mean(axis=0)  # average over test samples
+    A_std_avg  = A_std.mean(axis=0)   # average uncertainty over test samples
+
+    has_input = A_input is not None and omega_input is not None
+
+    if has_input:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8),
+                                        gridspec_kw={"height_ratios": [3, 1]},
+                                        sharex=True)
+    else:
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    if has_input:
+        ax1.fill_between(omega_input, A_input, alpha=0.2, color=COLORS["target"])
+        ax1.plot(omega_input, A_input, "-", color=COLORS["target"], linewidth=2,
+                 label="Ground truth")
+
+    n_mc_str = rf" ({n_mc} $z$-draws)" if n_mc else ""
+    ax1.plot(omega_eval_grid, A_mean_avg, "-", color=COLORS["pred"], linewidth=2,
+             label=rf"$\langle A(\omega) \rangle$ MC mean{n_mc_str}")
+    ax1.fill_between(omega_eval_grid,
+                     A_mean_avg - A_std_avg,
+                     A_mean_avg + A_std_avg,
+                     alpha=0.25, color=COLORS["pred"],
+                     label=rf"$\pm 1\sigma$ (VAE posterior uncertainty{n_mc_str})")
+
+    ax1.set_ylabel(r"$A(\omega)$")
+    ax1.set_title(
+        r"VAE Posterior Uncertainty: $z \sim \mathcal{N}(\mu,\sigma^2)$"
+        + (rf" $\times\,{n_mc}$ draws" if n_mc else "")
+        + r"; $\pm 1\sigma$ = epistemic spread per input"
+    )
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    if has_input:
+        A_input_interp = np.interp(omega_eval_grid, omega_input, A_input)
+        diff = A_mean_avg - A_input_interp
+        ax2.plot(omega_eval_grid, diff, "-", color="#D32F2F", linewidth=1.5)
+        ax2.fill_between(omega_eval_grid, diff, alpha=0.2, color="#D32F2F")
+        ax2.axhline(y=0, color="gray", linestyle="-", alpha=0.5)
+        dw = omega_eval_grid[1] - omega_eval_grid[0]
+        int_abs_err = np.sum(np.abs(diff)) * dw
+        ax2.set_xlabel(r"$\omega$")
+        ax2.set_ylabel(r"$\Delta A(\omega)$")
+        ax2.set_title(rf"Residual: $\int|\Delta A|d\omega = {int_abs_err:.4f}$")
+        ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    return fig
+
+
 def plot_finetune_eval(summary_file, output_dir=None):
     """Generate plots from a fine-tuning summary.pt file.
 
@@ -649,13 +834,14 @@ def plot_finetune_eval(summary_file, output_dir=None):
         spec_path = d["spectral_input_path"]
         if os.path.exists(spec_path):
             A_input = np.loadtxt(spec_path, delimiter=",")
-            # The spectral_input.csv files use omega = linspace(-6, 6, len(A))
-            omega_input = np.linspace(-6, 6, len(A_input))
+            # The spectral_input.csv files use omega = linspace(-5, 5, len(A))
+            omega_input = np.linspace(-5, 5, len(A_input))
             print(f"Loaded ground truth spectral function from: {spec_path}")
         else:
             print(f"WARNING: spectral_input_path not found: {spec_path}")
 
-    plot_gtau_comparison(G_input, G_recon, beta, n_samples=6,
+    noise_var = d.get("noise_var", None)
+    plot_gtau_comparison(G_input, G_recon, beta, n_samples=6, noise_var=noise_var,
                          save_path=os.path.join(output_dir, "gtau_comparison.pdf"))
 
     plot_poles_residues(poles, residues, n_samples=min(20, len(poles)),
@@ -671,6 +857,17 @@ def plot_finetune_eval(summary_file, output_dir=None):
     plot_spectral_average(poles, residues,
                           A_input=A_input, omega_input=omega_input,
                           save_path=os.path.join(output_dir, "spectral_average.pdf"))
+
+    # MC uncertainty band (if multi-sample eval was run)
+    if "A_mean" in d and "A_std" in d and "omega_eval_grid" in d:
+        A_mean_np = d["A_mean"].numpy()
+        A_std_np  = d["A_std"].numpy()
+        omega_np  = d["omega_eval_grid"].numpy()
+        n_mc = d.get("n_mc", None)
+        plot_spectral_mc(A_mean_np, A_std_np, omega_np,
+                         A_input=A_input, omega_input=omega_input,
+                         n_mc=n_mc,
+                         save_path=os.path.join(output_dir, "spectral_mc_uncertainty.pdf"))
 
     # Average G(tau)
     fig, ax = plt.subplots(figsize=(8, 5))

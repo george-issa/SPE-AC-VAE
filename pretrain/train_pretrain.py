@@ -7,6 +7,7 @@ and uses the pretraining loss functions.
 
 import numpy as np
 import torch
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
 from pretrain.pretrain_losses import pretrain_total_loss  # type: ignore
@@ -33,6 +34,8 @@ def train_pretrain(
     patience=10,
     deterministic=False,
     grad_clip_norm=5.0,
+    moment_fn=None,
+    lambda_moment=0.0,
 ):
     """Train the VAE with pretraining losses on synthetic data.
 
@@ -43,8 +46,8 @@ def train_pretrain(
     scheduler      : LR scheduler
     num_epochs     : int
     input_dim      : int (L_tau)
-    train_loader   : DataLoader yielding (G_tilde, mu, sigma) batches
-    val_loader     : DataLoader yielding (G_tilde, mu, sigma) batches
+    train_loader   : DataLoader — full dataset (no held-out split)
+    val_loader     : DataLoader — same as train_loader; scheduler monitors this
     spectral_mse_fn: SpectralMSELoss
     chi2_fn        : ChiSquaredLoss
     smoothness_fn  : SpectralSmoothnessLoss
@@ -55,7 +58,7 @@ def train_pretrain(
     device         : torch device
     out_dir        : str
     tag            : str
-    patience       : int, early stopping patience
+    patience       : int, early-stopping patience (set > num_epochs to disable)
     deterministic  : bool, if True use z=mu (no VAE sampling); use when alpha_kl=0
     grad_clip_norm : float, max gradient norm for clipping
 
@@ -65,7 +68,7 @@ def train_pretrain(
     best_epoch    : int
     """
     train_losses, val_losses = [], []
-    chi2_losses, spec_losses, smooth_losses, kl_losses = [], [], [], []
+    chi2_losses, spec_losses, smooth_losses, kl_losses, moment_losses = [], [], [], [], []
     best_val_loss = float("inf")
     counter = 0
     best_epoch = -1
@@ -81,11 +84,12 @@ def train_pretrain(
         epoch_spec = 0.0
         epoch_smooth = 0.0
         epoch_kl = 0.0
+        epoch_moment = 0.0
         n_samples = 0
 
         loop = tqdm(enumerate(train_loader), total=len(train_loader), leave=False)
 
-        for _, batch in loop:
+        for batch_idx, batch in loop:
             G_tilde, mu_targets, sigma_targets = batch
             B = G_tilde.shape[0]
 
@@ -97,13 +101,14 @@ def train_pretrain(
             mu_vae, logvar_vae, z, poles, residues, G_recon = model(G_tilde, deterministic=deterministic)
 
             # Combined loss
-            loss, chi2_val, spec_val, smooth_val, kl_val = pretrain_total_loss(
+            loss, chi2_val, spec_val, smooth_val, kl_val, moment_val = pretrain_total_loss(
                 G_recon, G_tilde,
                 mu_vae, logvar_vae,
                 poles, residues,
                 mu_targets, sigma_targets,
                 spectral_mse_fn, chi2_fn, smoothness_fn,
                 lambda_chi2, lambda_spec, lambda_smooth, alpha_kl,
+                moment_fn, lambda_moment,
             )
 
             optimizer.zero_grad()
@@ -116,6 +121,7 @@ def train_pretrain(
             epoch_spec += spec_val.item() * B
             epoch_smooth += smooth_val.item() * B
             epoch_kl += kl_val.item() * B
+            epoch_moment += moment_val.item() * B
             n_samples += B
 
             loop.set_description(f"{tag} Epoch [{epoch+1}/{num_epochs}]")
@@ -125,6 +131,7 @@ def train_pretrain(
                 spec=spec_val.item(),
                 smooth=smooth_val.item(),
                 kl=kl_val.item(),
+                moment=moment_val.item(),
                 total=loss.item(),
             )
 
@@ -134,6 +141,7 @@ def train_pretrain(
         spec_losses.append(epoch_spec / n_samples)
         smooth_losses.append(epoch_smooth / n_samples)
         kl_losses.append(epoch_kl / n_samples)
+        moment_losses.append(epoch_moment / n_samples)
 
         # ----- Validation -----
         model.eval()
@@ -151,13 +159,14 @@ def train_pretrain(
 
                 mu_vae, logvar_vae, z, poles, residues, G_recon = model(G_tilde, deterministic=deterministic)
 
-                loss, _, _, _, _ = pretrain_total_loss(
+                loss, _, _, _, _, _ = pretrain_total_loss(
                     G_recon, G_tilde,
                     mu_vae, logvar_vae,
                     poles, residues,
                     mu_targets, sigma_targets,
                     spectral_mse_fn, chi2_fn, smoothness_fn,
                     lambda_chi2, lambda_spec, lambda_smooth, alpha_kl,
+                    moment_fn, lambda_moment,
                 )
 
                 val_loss += loss.item() * B
@@ -166,12 +175,16 @@ def train_pretrain(
         val_loss /= n_val
         val_losses.append(val_loss)
 
-        scheduler.step(val_loss)
+        if isinstance(scheduler, ReduceLROnPlateau):
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
 
         print(
             f"{tag} Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e} "
             f"| chi2={chi2_losses[-1]:.4e} spec={spec_losses[-1]:.4e} "
-            f"smooth={smooth_losses[-1]:.4e} kl={kl_losses[-1]:.4e}"
+            f"smooth={smooth_losses[-1]:.4e} kl={kl_losses[-1]:.4e} "
+            f"moment={moment_losses[-1]:.4e}"
         )
 
         # Save best model
@@ -194,6 +207,7 @@ def train_pretrain(
         np.save(f"{out_dir}/losses/spec_losses_{tag}.npy", np.array(spec_losses))
         np.save(f"{out_dir}/losses/smooth_losses_{tag}.npy", np.array(smooth_losses))
         np.save(f"{out_dir}/losses/kl_losses_{tag}.npy", np.array(kl_losses))
+        np.save(f"{out_dir}/losses/moment_losses_{tag}.npy", np.array(moment_losses))
 
     print(f"{tag} training completed. Best val loss: {best_val_loss:.4e} at epoch {best_epoch+1}")
     return best_val_loss, best_epoch

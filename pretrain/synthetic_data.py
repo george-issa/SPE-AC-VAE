@@ -1,12 +1,18 @@
 """
 Synthetic single-Gaussian data generation for VAE pretraining.
 
-Implements the protocol from vae_pretraining_protocol.pdf:
-  1. Sample mu_n ~ N(0, sigma_mu), sigma_n ~ InverseGamma(alpha, beta)
+Sampling protocol:
+  1. mu    ~ Uniform(-mu_max, +mu_max)        — flat coverage of peak position
+     sigma ~ LogUniform(sigma_min, sigma_max) — flat log-scale coverage of peak width
   2. Compute clean G(tau) via numerical integration of K(tau, omega) * A(omega)
   3. Add DQMC-like noise via sqrt(C) @ R, where C is the covariance matrix
 
+Uniform / LogUniform avoids two failure modes of the old Gaussian + InverseGamma scheme:
+  - np.clip on N(0, sigma_mu) piles samples up at ±mu_max (identical G, zero signal).
+  - InverseGamma heavy tail piles samples up at sigma_max after clipping.
+
 Provides both a pre-generate-and-save workflow and an on-the-fly PyTorch Dataset.
+A diagnostic visualisation is produced automatically after data generation.
 """
 
 import os
@@ -51,24 +57,34 @@ def kernel_tau_fermi(omega, tau, beta):
 # Parameter sampling (from the PDF protocol)
 # ---------------------------------------------------------------------------
 
-def sample_gaussian_params(N, sigma_mu, mu_sigma, sigma_sigma, rng=None):
-    """Sample (mu, sigma) for N Gaussian spectral functions.
+def sample_gaussian_params(N, mu_max, sigma_min, sigma_max, rng=None):
+    """Sample (mu, sigma) for N single-Gaussian spectral functions.
 
-    mu_n     ~ N(0, sigma_mu)
-    sigma_n  ~ InverseGamma(alpha_sigma, beta_sigma)
+    mu    ~ Uniform(-mu_max, +mu_max)        — flat coverage of peak position
+    sigma ~ LogUniform(sigma_min, sigma_max) — flat log-scale coverage of peak width
 
-    where alpha_sigma = 2 + mu_sigma^2 / sigma_sigma^2
-          beta_sigma  = mu_sigma * (1 + mu_sigma^2 / sigma_sigma^2)
+    Why these distributions:
+      - Uniform mu gives equal representation to every peak location in the
+        physical range.  N(0, sigma_mu) concentrates 95% of samples near zero and
+        produces an artificial pile-up at ±mu_max when clipped.
+      - LogUniform sigma treats narrow (sigma=0.3) and wide (sigma=2.5) peaks on an
+        equal footing.  InverseGamma concentrates near its mean and its heavy tail
+        piles up at sigma_max after clipping.
 
-    This gives InverseGamma with mean = mu_sigma, std = sigma_sigma.
+    Physical guidance (for beta=10, integration cutoff omega_max=20):
+      - mu_max ~ 3: beyond |mu|=3, G(tau=beta/2) < 1e-6 — effectively zero and
+        provides no useful gradient signal.
+      - sigma_min ~ 0.3: narrowest peak the GL quadrature resolves reliably.
+      - sigma_max ~ 2.5: wide enough to cover the gaussian_double peak widths
+        while keeping the spectral weight within the integration domain.
 
     Parameters
     ----------
-    N            : int, number of samples
-    sigma_mu     : float, std of the Normal for mu
-    mu_sigma     : float, mean of the InverseGamma for sigma
-    sigma_sigma  : float, std of the InverseGamma for sigma
-    rng          : numpy Generator or None
+    N         : int
+    mu_max    : float — peak centers drawn from Uniform(-mu_max, +mu_max)
+    sigma_min : float — minimum peak width (log-uniform lower bound)
+    sigma_max : float — maximum peak width (log-uniform upper bound)
+    rng       : numpy Generator or None
 
     Returns
     -------
@@ -78,13 +94,9 @@ def sample_gaussian_params(N, sigma_mu, mu_sigma, sigma_sigma, rng=None):
     if rng is None:
         rng = np.random.default_rng()
 
-    mus = rng.normal(0.0, sigma_mu, size=N)
-
-    alpha_sigma = 2.0 + mu_sigma**2 / sigma_sigma**2
-    beta_sigma = mu_sigma * (1.0 + mu_sigma**2 / sigma_sigma**2)
-
-    # scipy InvGamma: pdf(x, a) = x^(-a-1) * exp(-1/x) / Gamma(a), with scale = beta
-    sigmas = stats.invgamma.rvs(a=alpha_sigma, scale=beta_sigma, size=N, random_state=rng)
+    mus = rng.uniform(-mu_max, mu_max, size=N)
+    log_sigmas = rng.uniform(np.log(sigma_min), np.log(sigma_max), size=N)
+    sigmas = np.exp(log_sigmas)
 
     return mus, sigmas
 
@@ -297,14 +309,14 @@ def add_noise(G_hat, sqrt_C, rng=None):
 
 def generate_and_save(
     N,
-    sigma_mu,
-    mu_sigma,
-    sigma_sigma,
+    mu_max,
+    sigma_min,
+    sigma_max,
     beta,
     dtau,
     output_dir,
     covariance_source=None,
-    use_quadrature=True,
+    use_quadrature=False,
     N_gl=512,
     omega_max=20.0,
     seed=None,
@@ -314,9 +326,9 @@ def generate_and_save(
     Parameters
     ----------
     N                 : int, number of samples
-    sigma_mu          : float, std of Normal for mu
-    mu_sigma          : float, mean of InverseGamma for sigma
-    sigma_sigma       : float, std of InverseGamma for sigma
+    mu_max            : float, peak centers ~ Uniform(-mu_max, +mu_max)
+    sigma_min         : float, min peak width — LogUniform lower bound
+    sigma_max         : float, max peak width — LogUniform upper bound
     beta              : float, inverse temperature
     dtau              : float, imaginary time step
     output_dir        : str, directory to save files
@@ -324,7 +336,7 @@ def generate_and_save(
         If str: path to existing DQMC Gbins CSV to compute covariance from.
         If None: compute covariance from the generated clean G(tau) curves.
     use_quadrature    : bool, if True use adaptive quadrature (slow, precise);
-                        if False use GL quadrature (fast)
+                        if False use GL quadrature (fast, recommended)
     N_gl              : int, GL nodes per half-axis (if use_quadrature=False)
     omega_max         : float, integration cutoff (if use_quadrature=False)
     seed              : int or None, random seed
@@ -337,7 +349,7 @@ def generate_and_save(
     print(f"Generating {N} synthetic Gaussian samples (beta={beta}, L_tau={L_tau})...")
 
     # 1. Sample parameters
-    mus, sigmas = sample_gaussian_params(N, sigma_mu, mu_sigma, sigma_sigma, rng=rng)
+    mus, sigmas = sample_gaussian_params(N, mu_max, sigma_min, sigma_max, rng=rng)
     print(f"  mu range: [{mus.min():.3f}, {mus.max():.3f}]")
     print(f"  sigma range: [{sigmas.min():.3f}, {sigmas.max():.3f}]")
 
@@ -353,10 +365,22 @@ def generate_and_save(
 
     # 3. Covariance matrix
     if covariance_source is not None:
+        if not os.path.exists(covariance_source):
+            raise FileNotFoundError(
+                f"covariance_source not found: {covariance_source}\n"
+                f"Provide a valid DQMC Gbins CSV path so that the chi-squared loss "
+                f"is calibrated to the actual measurement noise. "
+                f"Set covariance_source=None only as a last resort — in that case "
+                f"the signal covariance of clean G(tau) is used instead, which is "
+                f"physically incorrect for chi-squared normalisation."
+            )
         print(f"  Loading covariance from: {covariance_source}")
         C = load_covariance_from_dqmc(covariance_source)
     else:
-        print("  Computing covariance from generated clean G(tau)...")
+        print("  WARNING: covariance_source is None.")
+        print("  Computing covariance from clean G(tau) signal — this is the signal")
+        print("  covariance, NOT the DQMC noise covariance. chi-squared will self-")
+        print("  normalise to 1 but will not reflect real measurement noise structure.")
         C = compute_covariance_from_bins(G_hat)
 
     sqrt_C = cholesky_sqrt(C)
@@ -396,23 +420,23 @@ class SyntheticGaussianDataset(Dataset):
 
     Parameters
     ----------
-    N_samples    : int, virtual dataset size (controls epoch length)
-    sigma_mu     : float
-    mu_sigma     : float
-    sigma_sigma  : float
-    beta         : float
-    dtau         : float
-    sqrt_C       : ndarray (L_tau, L_tau), Cholesky factor of covariance
-    N_gl         : int, GL quadrature nodes per half-axis
-    omega_max    : float, integration cutoff
+    N_samples : int, virtual dataset size (controls epoch length)
+    mu_max    : float — peak centers from Uniform(-mu_max, +mu_max)
+    sigma_min : float — min peak width (LogUniform lower bound)
+    sigma_max : float — max peak width (LogUniform upper bound)
+    beta      : float
+    dtau      : float
+    sqrt_C    : ndarray (L_tau, L_tau), Cholesky factor of covariance
+    N_gl      : int, GL quadrature nodes per half-axis
+    omega_max : float, integration cutoff
     """
 
-    def __init__(self, N_samples, sigma_mu, mu_sigma, sigma_sigma,
+    def __init__(self, N_samples, mu_max, sigma_min, sigma_max,
                  beta, dtau, sqrt_C, N_gl=512, omega_max=20.0):
         self.N_samples = N_samples
-        self.sigma_mu = sigma_mu
-        self.mu_sigma = mu_sigma
-        self.sigma_sigma = sigma_sigma
+        self.mu_max = mu_max
+        self._log_sigma_min = np.log(sigma_min)
+        self._log_sigma_max = np.log(sigma_max)
         self.beta = beta
         self.dtau = dtau
         self.L_tau = int(round(beta / dtau))
@@ -424,20 +448,15 @@ class SyntheticGaussianDataset(Dataset):
             self.taus, beta, N_gl, omega_max
         )
 
-        # InverseGamma parameters
-        self._alpha_sigma = 2.0 + mu_sigma**2 / sigma_sigma**2
-        self._beta_sigma = mu_sigma * (1.0 + mu_sigma**2 / sigma_sigma**2)
-
     def __len__(self):
         return self.N_samples
 
     def __getitem__(self, idx):
         rng = np.random.default_rng()
 
-        # Sample mu, sigma
-        mu = rng.normal(0.0, self.sigma_mu)
-        sigma = stats.invgamma.rvs(a=self._alpha_sigma, scale=self._beta_sigma,
-                                   random_state=rng)
+        # Sample mu ~ Uniform, sigma ~ LogUniform
+        mu = rng.uniform(-self.mu_max, self.mu_max)
+        sigma = np.exp(rng.uniform(self._log_sigma_min, self._log_sigma_max))
 
         # Compute Gaussian PDF at quadrature nodes
         A = _gaussian_pdf(self._omega_nodes, mu, sigma)
@@ -483,3 +502,146 @@ class SavedSyntheticDataset(Dataset):
             torch.tensor(self.mus[idx], dtype=torch.float32),
             torch.tensor(self.sigmas[idx], dtype=torch.float32),
         )
+
+
+# ---------------------------------------------------------------------------
+# Dataset visualisation
+# ---------------------------------------------------------------------------
+
+def visualize_synthetic_dataset(data_dir, beta, dtau, save_path=None, n_show=40):
+    """Load saved synthetic dataset and produce a diagnostic overview figure.
+
+    Six panels
+    ----------
+    (0,0) 2D scatter (mu, log-sigma)   — should show a uniform rectangular cloud
+    (0,1) Histogram of mu              — should be flat (Uniform)
+    (0,2) Histogram of log(sigma)      — should be flat (LogUniform)
+    (1,0) n_show clean G(tau) curves   — colored by mu; full diversity expected
+    (1,1) n_show A(omega) curves       — colored by mu; widths and positions diverse
+    (1,2) G(tau=0) distribution        — spans [0,1]; varies with mu via Fermi function
+
+    Figure is saved to data_dir/dataset_overview.pdf (or save_path if given).
+
+    Parameters
+    ----------
+    data_dir  : str — directory containing Ghat_clean.csv and params.csv
+    beta      : float — inverse temperature
+    dtau      : float — imaginary time step
+    save_path : str or None
+    n_show    : int — number of example curves to draw (default 40)
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+
+    plt.rcParams.update({
+        "font.size": 12,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "legend.fontsize": 10,
+        "figure.dpi": 120,
+        "font.family": "serif",
+        "text.usetex": True,
+        "text.latex.preamble": r"\usepackage{amsmath} \usepackage{amssymb}",
+    })
+
+    # ------------------------------------------------------------------
+    # Load data
+    # ------------------------------------------------------------------
+    G_hat  = np.loadtxt(os.path.join(data_dir, "Ghat_clean.csv"),  delimiter=",")
+    params = np.loadtxt(os.path.join(data_dir, "params.csv"), delimiter=",", skiprows=1)
+    mus    = params[:, 0]
+    sigmas = params[:, 1]
+
+    N, L_tau = G_hat.shape
+    taus = np.linspace(0.0, beta - dtau, L_tau)
+
+    # Random subset for curve panels — sort by mu for readable color gradient
+    rng_vis    = np.random.default_rng(0)
+    idx        = rng_vis.choice(N, size=min(n_show, N), replace=False)
+    idx_sorted = idx[np.argsort(mus[idx])]
+
+    mu_lo, mu_hi = mus.min(), mus.max()
+    norm  = plt.Normalize(mu_lo, mu_hi)
+    cmap  = cm.RdBu_r
+
+    # ------------------------------------------------------------------
+    # Build figure
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig.suptitle(
+        rf"Synthetic Gaussian Dataset"
+        rf" $\;\cdot\;$ $N = {N}$"
+        rf" $\;\cdot\;$ $\mu \in [{mu_lo:.2f},\,{mu_hi:.2f}]$"
+        rf" $\;\cdot\;$ $\sigma \in [{sigmas.min():.2f},\,{sigmas.max():.2f}]$"
+        rf" $\;\cdot\;$ $\beta = {beta:.0f}$",
+        fontsize=13,
+    )
+
+    # --- (0,0): 2D density (mu, log-sigma) ---
+    ax = axes[0, 0]
+    h = ax.hist2d(mus, np.log(sigmas), bins=40, cmap="Blues")
+    plt.colorbar(h[3], ax=ax, label="Count", pad=0.01)
+    ax.set_xlabel(r"$\mu$")
+    ax.set_ylabel(r"$\log\,\sigma$")
+    ax.set_title(r"Parameter coverage ($\mu$,\;$\log\,\sigma$)"
+                 "\n(uniform rectangle expected)")
+
+    # --- (0,1): Histogram of mu ---
+    ax = axes[0, 1]
+    ax.hist(mus, bins=60, color="steelblue", edgecolor="none", alpha=0.85)
+    ax.set_xlabel(r"$\mu$")
+    ax.set_ylabel("Count")
+    ax.set_title(r"Peak position $\mu$" + "\n(should be flat --- Uniform)")
+    ax.axvline(0, color="k", linestyle="--", linewidth=0.8)
+
+    # --- (0,2): Histogram of log(sigma) ---
+    ax = axes[0, 2]
+    ax.hist(np.log(sigmas), bins=60, color="darkorange", edgecolor="none", alpha=0.85)
+    ax.set_xlabel(r"$\log\,\sigma$")
+    ax.set_ylabel("Count")
+    ax.set_title(r"Peak width $\log\,\sigma$" + "\n(should be flat --- LogUniform)")
+
+    # Shared colorbar scalar mappable for curve panels
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+
+    # --- (1,0): Example clean G(tau) curves ---
+    ax = axes[1, 0]
+    for i in idx_sorted:
+        ax.plot(taus, G_hat[i], color=cmap(norm(mus[i])), alpha=0.55, linewidth=0.8)
+    ax.set_xlabel(r"$\tau$")
+    ax.set_ylabel(r"$G(\tau)$")
+    ax.set_title(rf"Clean $G(\tau)$: {len(idx_sorted)} samples (coloured by $\mu$)")
+    plt.colorbar(sm, ax=ax, label=r"$\mu$", pad=0.01)
+
+    # --- (1,1): Example A(omega) Gaussian curves ---
+    ax = axes[1, 1]
+    omega_grid = np.linspace(-8.0, 8.0, 400)
+    for i in idx_sorted:
+        A = _gaussian_pdf(omega_grid, mus[i], sigmas[i])
+        ax.plot(omega_grid, A, color=cmap(norm(mus[i])), alpha=0.55, linewidth=0.8)
+    ax.set_xlabel(r"$\omega$")
+    ax.set_ylabel(r"$A(\omega)$")
+    ax.set_title(rf"Spectral functions $A(\omega)$: {len(idx_sorted)} samples")
+    plt.colorbar(sm, ax=ax, label=r"$\mu$", pad=0.01)
+
+    # --- (1,2): G(tau=0) distribution ---
+    ax = axes[1, 2]
+    ax.hist(G_hat[:, 0], bins=60, color="mediumseagreen", edgecolor="none", alpha=0.85)
+    ax.set_xlabel(r"$G(\tau{=}0)$")
+    ax.set_ylabel("Count")
+    ax.set_title(r"$G(\tau{=}0)$ distribution"
+                 "\n" r"(Fermi function of $\mu$; should span $[0,1]$)")
+    ax.axvline(0.5, color="k", linestyle="--", linewidth=0.8,
+               label=r"$G = 0.5$ (PH sym.)")
+    ax.legend()
+
+    plt.tight_layout()
+
+    if save_path is None:
+        save_path = os.path.join(data_dir, "dataset_overview.pdf")
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Dataset overview saved to: {save_path}")
