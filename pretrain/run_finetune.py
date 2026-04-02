@@ -119,8 +119,8 @@ FINETUNE_EPOCHS = 50
 FINETUNE_LR = 1e-3        
 FINETUNE_PATIENCE = FINETUNE_EPOCHS + 1              # Early stopping enabled with a wide window
 FINETUNE_KL_ANNEAL_EPOCHS = 0
-_model_tag = {2: "v2", "2t": "v2t", "2s": "v2s", 3: "v3", 4: "v3L"}.get(MODEL_VERSION, f"v{MODEL_VERSION}")
-_sim_tag = "-4"
+_model_tag = {2: "v2", "2t": "v2t", "2s": "v2s"}.get(MODEL_VERSION, f"v{MODEL_VERSION}")
+_sim_tag = "-5"
 sID = ("pretrained" if LOAD_PRETRAIN else "fresh") + f"-{_model_tag}" + f"{_sim_tag}"
 
 # Loss weights
@@ -130,7 +130,7 @@ LAMBDA_POS = 0.0        # Positivity loss disabled; pole structure enforces A(om
 ALPHA_KL = 1e-6         # Very mild KL regularization (matches Ben)
 ETA0 = 1.0              # G(tau) >= 0 penalty — variance-weighted via diag(C)
 ETA2 = 1.0              # G''(tau) >= 0 penalty — variance-weighted via diag(C)
-ETA4 = 0.0              # G''''(tau) >= 0 penalty — variance-weighted via diag(C)
+ETA4 = 0.0              # G''''(tau) >= 0 penalty — keep OFF (causes divergence at 1.0)
 
 # ReduceLROnPlateau: uncomment and set USE_SCHEDULER = True to enable.
 USE_SCHEDULER = False
