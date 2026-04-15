@@ -51,9 +51,9 @@ MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
 OUT_BASE  = os.path.join(MAIN_PATH, "out")
 
 # Fresh run: run_finetune.py with LOAD_PRETRAIN=False
-FRESH_DIR      = os.path.join(OUT_BASE, "finetune_gaussian_double_numpoles4_s1e-04_xi0.5-fresh-v2L-2")
+FRESH_DIR      = os.path.join(OUT_BASE, "finetune_gaussian_double_numpoles6_s1e-04_xi0.5-fresh-v2L-2")
 # Pretrained run: run_pretrain_pipeline.py
-PRETRAINED_DIR = os.path.join(OUT_BASE, "finetune_gaussian_double_numpoles4_s1e-04_xi0.5-pretrained-v2L")
+PRETRAINED_DIR = os.path.join(OUT_BASE, "finetune_gaussian_double_numpoles6_s1e-04_xi0.5-pretrained-v2L-wide")
 
 TAG = "finetune"
 

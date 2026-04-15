@@ -77,7 +77,7 @@ N_NODES = 256
 BATCH_SIZE = 50
 
 # --- Run label (used in output dir names) ---
-sID = "pretrained-v2L"
+sID = "pretrained-v2L-wide"
 
 # Reproducibility — set to an integer (e.g. 42) for deterministic runs, or None to disable
 SEED = None

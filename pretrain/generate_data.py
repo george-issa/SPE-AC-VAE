@@ -31,8 +31,8 @@ N = 1000
 # mu    ~ Uniform(-MU_MAX, +MU_MAX)        : peak position
 # sigma ~ LogUniform(SIGMA_MIN, SIGMA_MAX) : peak width
 MU_MAX    = 0.5   # |mu| ≤ MU_MAX; beyond ~3 G(tau) is near-zero for beta=10
-SIGMA_MIN = 0.3   # narrowest reliably-resolved peak
-SIGMA_MAX = 3.0   # widest peak; keeps spectral weight inside integration domain
+SIGMA_MIN = 3.0   # narrowest reliably-resolved peak
+SIGMA_MAX = 6.0   # widest peak; keeps spectral weight inside integration domain
 
 # Physical grid
 BETA      = 10.0
