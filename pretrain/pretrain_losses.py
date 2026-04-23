@@ -241,23 +241,32 @@ class SpectralPositivityLoss(nn.Module):
 
     L_pos = (1/B) sum_batch  integral ReLU(-A(omega))^2 d omega
 
+    Evaluated via Gauss-Legendre quadrature with sinh-arcsinh variable
+    transformation: omega = sinh(t), d omega = cosh(t) dt, t in [-T, T]
+    where T = arcsinh(4*W). This clusters grid points near omega=0 where
+    spectral features are sharp and is consistent with SpectralMSELoss.
+
     Parameters
     ----------
-    Nw   : int, number of omega grid points
-    wmin : float, lower bound of omega grid
-    wmax : float, upper bound of omega grid
+    W    : float, approximate bandwidth (grid covers +- 4W in omega)
+    N_gl : int, number of Gauss-Legendre nodes
     """
 
-    def __init__(self, Nw=500, wmin=-8.0, wmax=8.0):
+    def __init__(self, W=6.0, N_gl=128):
         super().__init__()
-        omegas = torch.linspace(wmin, wmax, Nw, dtype=torch.float32)
-        self.register_buffer("omegas", omegas)
-        self.dw = (wmax - wmin) / (Nw - 1)
+        T = np.arcsinh(4.0 * W)
+        nodes_ref, weights_ref = special.roots_legendre(N_gl)
+        t_nodes     = T * nodes_ref
+        t_weights   = T * weights_ref
+        omega_nodes = np.sinh(t_nodes)
+        eff_weights = t_weights * np.cosh(t_nodes)
+        self.register_buffer("omega_nodes", torch.tensor(omega_nodes, dtype=torch.float32))
+        self.register_buffer("eff_weights", torch.tensor(eff_weights, dtype=torch.float32))
 
     def forward(self, poles, residues):
-        A = spectral_from_poles(poles, residues, self.omegas)
-        loss = torch.sum(torch.relu(-A) ** 2, dim=1).mean() * self.dw
-        return loss
+        A   = spectral_from_poles(poles, residues, self.omega_nodes)  # (B, N_gl)
+        neg = torch.relu(-A) ** 2
+        return (neg * self.eff_weights.unsqueeze(0)).sum(dim=1).mean()
 
 
 # ---------------------------------------------------------------------------

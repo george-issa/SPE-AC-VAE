@@ -54,6 +54,11 @@ from pretrain.plot_results import (  # type: ignore
 from pretrain.synthetic_data import (  # type: ignore
     load_covariance_from_dqmc,
 )
+from data_process_real import (  # type: ignore
+    SmoQyV2Dataset,
+    load_covariance_v2,
+    read_model_params,
+)
 from pretrain.pretrain_losses import (  # type: ignore
     KLDivergenceLoss,
     ChiSquaredLoss,
@@ -75,16 +80,56 @@ from utils import MakeOutPath  # type: ignore
 # ==========================================================================
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
+MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# --- Model (must match pretraining) ---
+# --- Data source: "synthetic" or "real" ---
+DATA_SOURCE = "real"   # switch between synthetic CSV and real QMC JLD2
+
+# --- Model ---
 LOAD_PRETRAIN = False
-NUM_POLES = 6
-BETA = 10.0
-DTAU = 0.05
-INPUT_DIM = int(BETA / DTAU)        # Must match the dimension of the input Green's function
+NUM_POLES = 3
 N_NODES = 256
-BATCH_SIZE = 50
+BATCH_SIZE = 10
+
+# --------------------------------------------------------------------------
+# Synthetic data (DATA_SOURCE = "synthetic")
+# --------------------------------------------------------------------------
+SPECTRAL_TYPE = "gaussian_double"
+NOISE_S = 1e-04
+NOISE_XI = 0.5
+INPUT_ID = "inputs-8"
+SYNTHETIC_DATA_PATH = os.path.join(
+    MAIN_PATH, "Data", "datasets", "synthetic",
+    f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
+    f"Gbins_s{NOISE_S:.0e}_xi{NOISE_XI}.csv"
+)
+SPECTRAL_INPUT_PATH = os.path.join(
+    MAIN_PATH, "Data", "datasets", "synthetic",
+    f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
+    "spectral_input.csv"
+)
+
+# --------------------------------------------------------------------------
+# Real QMC data (DATA_SOURCE = "real")
+# *** Only this line should change when uploading a new simulation folder ***
+# --------------------------------------------------------------------------
+QMC_SIM_DIR = os.path.join(
+    MAIN_PATH, "Data", "datasets", "real",
+    "hubbard_square_U8.00_mu0.00_L4_b6.00-1"
+)
+
+# --------------------------------------------------------------------------
+# Shared physical parameters
+# --------------------------------------------------------------------------
+if DATA_SOURCE == "real":
+    _qmc_params = read_model_params(QMC_SIM_DIR)
+    BETA      = _qmc_params["beta"]
+    DTAU      = _qmc_params["dtau"]
+    INPUT_DIM = _qmc_params["L_tau"]   # authoritative — no floating-point precision issue
+else:
+    BETA      = 10.0
+    DTAU      = 0.05
+    INPUT_DIM = int(round(BETA / DTAU))
 
 # --- Pretrained checkpoint ---
 PRETRAIN_DIR = os.path.join(
@@ -93,40 +138,17 @@ PRETRAIN_DIR = os.path.join(
 )
 PRETRAIN_CHECKPOINT = os.path.join(PRETRAIN_DIR, "model", "best_model_pretrain.pth")
 
-# --- Target dataset ---
-SPECTRAL_TYPE = "gaussian_double"
-NOISE_S = 1e-04
-NOISE_XI = 0.5
-INPUT_ID = "inputs-8"  # Which inputs folder to use
-DATA_PATH = os.path.join(
-    MAIN_PATH, "Data", "datasets",
-    f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
-    f"Gbins_s{NOISE_S:.0e}_xi{NOISE_XI}.csv"
-)
-
-# --- Covariance source (same dataset used for chi2 loss) ---
-COVARIANCE_SOURCE = DATA_PATH
-
-# --- Ground truth spectral function (for evaluation plots) ---
-SPECTRAL_INPUT_PATH = os.path.join(
-    MAIN_PATH, "Data", "datasets",
-    f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
-    "spectral_input.csv"
-)
-
 # --- Fine-tuning hyperparameters ---
-FINETUNE_EPOCHS = 50
+FINETUNE_EPOCHS = 1000
 FINETUNE_LR = 1e-3        
 FINETUNE_PATIENCE = FINETUNE_EPOCHS + 1              # Early stopping enabled with a wide window
 FINETUNE_KL_ANNEAL_EPOCHS = 0
 _model_tag = {2: "v2", "2t": "v2t", "2s": "v2s"}.get(MODEL_VERSION, f"v{MODEL_VERSION}")
-_sim_tag = "-5"
-sID = ("pretrained" if LOAD_PRETRAIN else "fresh") + f"-{_model_tag}" + f"{_sim_tag}"
 
 # Loss weights
 LAMBDA_CHI2 = 1.0       # Covariance-weighted reconstruction (chi^2 → 1 at perfect fit)
 LAMBDA_SMOOTH = 0.0     # Smoothness loss disabled; fights narrow Gaussian peaks
-LAMBDA_POS = 0.0        # Positivity loss disabled; pole structure enforces A(omega) >= 0
+LAMBDA_POS = 0.1        # Positivity loss 
 ALPHA_KL = 1e-6         # Very mild KL regularization (matches Ben)
 ETA0 = 1.0              # G(tau) >= 0 penalty — variance-weighted via diag(C)
 ETA2 = 1.0              # G''(tau) >= 0 penalty — variance-weighted via diag(C)
@@ -140,11 +162,14 @@ LR_MIN = 1e-6           # Floor for LR
 
 # Spectral evaluation grid
 SMOOTHNESS_NW = 500
-SMOOTHNESS_WMIN = -8.0
-SMOOTHNESS_WMAX = 8.0
+SMOOTHNESS_WMIN = -20.0
+SMOOTHNESS_WMAX = 20.0
 
 # Reproducibility — set to an integer (e.g. 42) for deterministic runs, or None to disable
 SEED = None
+
+# Set False on the cluster — all plotting stays on the local machine
+DO_PLOT = True
 
 
 # ==========================================================================
@@ -190,17 +215,54 @@ def main():
     # STAGE 2: Fine-tuning on target dataset
     # ------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print(f"STAGE 2: FINE-TUNING ON {SPECTRAL_TYPE.upper()} DATA")
+    print(f"STAGE 2: FINE-TUNING ON {DATA_SOURCE.upper()} DATA")
     print("=" * 80 + "\n")
 
     tag = "finetune"
 
     # --- Output directory ---
-    ft_out_dir = os.path.join(
-        MAIN_PATH, "out",
-        f"finetune_{SPECTRAL_TYPE}_numpoles{NUM_POLES}_s{NOISE_S:.0e}_xi{NOISE_XI}-{sID}"
+    _out_label = (
+        f"real-{os.path.basename(QMC_SIM_DIR)}"
+        if DATA_SOURCE == "real"
+        else f"synthetic-{SPECTRAL_TYPE}_s{NOISE_S:.0e}_xi{NOISE_XI}"
     )
+    _init_tag  = "pretrained" if LOAD_PRETRAIN else "fresh"
+    _base_name = f"finetune_{_out_label}_numpoles{NUM_POLES}-{_init_tag}-{_model_tag}"
+    _out_root  = os.path.join(MAIN_PATH, "out")
+    os.makedirs(_out_root, exist_ok=True)
+    _used_ids  = [
+        int(d[len(_base_name) + 1:])
+        for d in os.listdir(_out_root)
+        if os.path.isdir(os.path.join(_out_root, d))
+        and d.startswith(_base_name + "-")
+        and d[len(_base_name) + 1:].isdigit()
+    ]
+    _next_id   = max(_used_ids, default=0) + 1
+    sID        = f"{_init_tag}-{_model_tag}-{_next_id}"
+    ft_out_dir = os.path.join(_out_root, f"finetune_{_out_label}_numpoles{NUM_POLES}-{sID}")
+    print(f"Output directory: {ft_out_dir}")
     MakeOutPath(ft_out_dir)
+
+    # --- Load full dataset — train on all samples, no held-out split ---
+    if DATA_SOURCE == "real":
+        print(f"Loading real QMC dataset from: {QMC_SIM_DIR}")
+        ft_dataset = SmoQyV2Dataset(QMC_SIM_DIR, r1=0, r2=0)
+        ft_dataset.summary()
+        C = load_covariance_v2(QMC_SIM_DIR, r1=0, r2=0)
+    else:
+        print(f"Loading synthetic dataset from: {SYNTHETIC_DATA_PATH}")
+        ft_dataset = GreenFunctionDataset(file_path=SYNTHETIC_DATA_PATH)
+        C = load_covariance_from_dqmc(SYNTHETIC_DATA_PATH)
+
+    N_samples = len(ft_dataset)
+
+    _g = None
+    if SEED is not None:
+        _g = torch.Generator()
+        _g.manual_seed(SEED)
+    train_loader = DataLoader(ft_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, generator=_g)
+    val_loader = train_loader  # Same data; ReduceLROnPlateau monitors eval-mode training loss
+    print(f"  Full dataset: {N_samples} samples, batch_size={BATCH_SIZE}, {len(train_loader)} batches/epoch")
 
     # --- Save run parameters for reference ---
     params = {
@@ -212,11 +274,14 @@ def main():
         "BETA": BETA,
         "DTAU": DTAU,
         "BATCH_SIZE": BATCH_SIZE,
-        "SPECTRAL_TYPE": SPECTRAL_TYPE,
-        "NOISE_S": NOISE_S,
-        "NOISE_XI": NOISE_XI,
-        "INPUT_ID": INPUT_ID,
-        "DATA_PATH": DATA_PATH,
+        "DATA_SOURCE": DATA_SOURCE,
+        **({} if DATA_SOURCE == "real" else {
+            "SPECTRAL_TYPE": SPECTRAL_TYPE,
+            "NOISE_S": NOISE_S,
+            "NOISE_XI": NOISE_XI,
+            "INPUT_ID": INPUT_ID,
+        }),
+        "DATA_PATH": QMC_SIM_DIR if DATA_SOURCE == "real" else SYNTHETIC_DATA_PATH,
         "LOAD_PRETRAIN": LOAD_PRETRAIN,
         "FINETUNE_EPOCHS": FINETUNE_EPOCHS,
         "FINETUNE_LR": FINETUNE_LR,
@@ -242,25 +307,13 @@ def main():
         json.dump(params, _f, indent=2)
     print(f"Run parameters saved to {ft_out_dir}/params.json")
 
-    # --- Load full dataset — train on all samples, no held-out split ---
-    print(f"Loading dataset from: {DATA_PATH}")
-    ft_dataset = GreenFunctionDataset(file_path=DATA_PATH)
-    _g = None
-    if SEED is not None:
-        _g = torch.Generator()
-        _g.manual_seed(SEED)
-    train_loader = DataLoader(ft_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, generator=_g)
-    val_loader = train_loader  # Same data; ReduceLROnPlateau monitors eval-mode training loss
-    print(f"  Full dataset: {len(ft_dataset)} samples, {len(train_loader)} batches/epoch")
-
     # --- Load covariance and build loss modules ---
-    print(f"Loading covariance from: {COVARIANCE_SOURCE}")
-    C = load_covariance_from_dqmc(COVARIANCE_SOURCE)
+    print(f"Covariance shape: {C.shape}")
 
     kl_fn         = KLDivergenceLoss().to(DEVICE)
     chi2_fn       = ChiSquaredLoss(C).to(DEVICE)
     smoothness_fn = SpectralSmoothnessLoss(Nw=SMOOTHNESS_NW, wmin=SMOOTHNESS_WMIN, wmax=SMOOTHNESS_WMAX).to(DEVICE)
-    positivity_fn = SpectralPositivityLoss(Nw=SMOOTHNESS_NW, wmin=SMOOTHNESS_WMIN, wmax=SMOOTHNESS_WMAX).to(DEVICE)
+    positivity_fn = SpectralPositivityLoss().to(DEVICE)
     neg_green_fn  = NegativeGreenPenalty(C).to(DEVICE)
     neg_second_fn = NegativeSecondDerivativePenalty(C).to(DEVICE)
     neg_fourth_fn = NegativeFourthDerivativePenalty(C).to(DEVICE)
@@ -307,7 +360,15 @@ def main():
         kl_anneal_epochs=FINETUNE_KL_ANNEAL_EPOCHS,
     )
 
+    chi2_losses   = np.load(f"{ft_out_dir}/losses/chi2_losses_{tag}.npy")
+    best_chi2     = float(np.min(chi2_losses))
+    best_chi2_ep  = int(np.argmin(chi2_losses)) + 1
+    final_chi2    = float(chi2_losses[-1])
+    n_epochs_run  = len(chi2_losses)
+
     print(f"\nFine-tuning done. Best val loss: {best_val_loss:.4e} at epoch {best_epoch+1}")
+    print(f"chi2 summary  |  best: {best_chi2:.4f} @ epoch {best_chi2_ep}/{n_epochs_run}"
+          f"  |  final: {final_chi2:.4f}")
 
     # Load best model
     model.load_state_dict(torch.load(f"{ft_out_dir}/model/best_model_{tag}.pth", weights_only=True))
@@ -353,16 +414,6 @@ def main():
     poles_all     = torch.cat(poles_all,     dim=0)
     residues_all  = torch.cat(residues_all,  dim=0)
 
-    # Deterministic spectral evaluation: z = mu (mode of the posterior)
-    print("\n--- Deterministic spectral evaluation (z = mu) ---")
-    omega_eval_grid = torch.linspace(SMOOTHNESS_WMIN, SMOOTHNESS_WMAX, SMOOTHNESS_NW)
-    with torch.no_grad():
-        A_mean = spectral_from_poles(
-            poles_all.to(DEVICE), residues_all.to(DEVICE), omega_eval_grid.to(DEVICE)
-        ).cpu()
-    A_std = torch.zeros_like(A_mean)
-    print(f"Deterministic spectral shape: {A_mean.shape}")
-
     torch.save({
         "inputs":       G_input_all,
         "recon":        G_recon_all,
@@ -372,25 +423,33 @@ def main():
         "recon_avg":    G_recon_all.mean(dim=0),
         "poles_avg":    poles_all.mean(dim=0),
         "residues_avg": residues_all.mean(dim=0),
-        "A_mean":       A_mean,
-        "A_std":        A_std,
-        "omega_eval_grid":    omega_eval_grid,
         "beta":               BETA,
         "Ltau":               INPUT_DIM,
-        "spectral_input_path": SPECTRAL_INPUT_PATH,
+        "spectral_input_path": None if DATA_SOURCE == "real" else SPECTRAL_INPUT_PATH,
         "noise_var":    float(np.mean(np.diag(np.array(C)))),
+        "data_source":        DATA_SOURCE,
+        "sim_name":           os.path.basename(QMC_SIM_DIR) if DATA_SOURCE == "real" else None,
+        "num_poles":          NUM_POLES,
+        "sID":                sID,
+        "best_chi2":          best_chi2,
+        "best_chi2_epoch":    best_chi2_ep,
+        "final_chi2":         final_chi2,
+        "n_epochs":           n_epochs_run,
     }, f"{ft_out_dir}/summary.pt")
 
     print(f"Summary saved to {ft_out_dir}/summary.pt")
     print(f"Poles mean: {poles_all.mean(dim=0)}")
     print(f"Residues mean: {residues_all.mean(dim=0)}")
 
-    # --- Plot fine-tuning results ---
-    print("\n--- Generating fine-tuning plots ---")
-    plot_finetune_eval(f"{ft_out_dir}/summary.pt")
-    plot_loss_curves(f"{ft_out_dir}/losses", tag=tag,
-                     save_path=f"{ft_out_dir}/plots/loss_curves_{tag}.pdf",
-                     params=params)
+    # --- Plot fine-tuning results (local only) ---
+    if DO_PLOT:
+        print("\n--- Generating fine-tuning plots ---")
+        plot_finetune_eval(f"{ft_out_dir}/summary.pt")
+        plot_loss_curves(f"{ft_out_dir}/losses", tag=tag,
+                         save_path=f"{ft_out_dir}/plots/loss_curves_{tag}.pdf",
+                         params=params)
+    else:
+        print("\nDO_PLOT=False — skipping plots. Run locally after downloading out/.")
 
 
 if __name__ == "__main__":

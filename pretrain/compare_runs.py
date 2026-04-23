@@ -47,7 +47,7 @@ plt.rcParams.update({
 # CONFIGURATION — update these to point at your completed runs
 # ==========================================================================
 
-MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
+MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_BASE  = os.path.join(MAIN_PATH, "out")
 
 # Fresh run: run_finetune.py with LOAD_PRETRAIN=False

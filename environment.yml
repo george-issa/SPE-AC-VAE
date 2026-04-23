@@ -1,0 +1,16 @@
+name: spe-ac-vae
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - numpy
+  - scipy
+  - matplotlib
+  - tqdm
+  - h5py
+  - pyqt
+# Julia not on conda-forge (osx-arm64); install separately: brew install julia

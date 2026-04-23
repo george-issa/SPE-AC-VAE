@@ -66,7 +66,7 @@ from utils import MakeOutPath  # type: ignore
 # ==========================================================================
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
+MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # --- Model (must match run_finetune.py) ---
 NUM_POLES = 6
@@ -76,8 +76,8 @@ INPUT_DIM = int(BETA / DTAU)   # 200
 N_NODES = 256
 BATCH_SIZE = 50
 
-# --- Run label (used in output dir names) ---
-sID = "pretrained-v2L-wide"
+# --- Model tag (sID is determined at runtime by auto-incrementing) ---
+_model_tag = "v2L"
 
 # Reproducibility — set to an integer (e.g. 42) for deterministic runs, or None to disable
 SEED = None
@@ -93,12 +93,12 @@ NOISE_XI = 0.5
 INPUT_ID = "inputs-8"
 
 DQMC_DATA_PATH = os.path.join(
-    MAIN_PATH, "Data", "datasets",
+    MAIN_PATH, "Data", "datasets", "synthetic",
     f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
     f"Gbins_s{NOISE_S:.0e}_xi{NOISE_XI}.csv"
 )
 SPECTRAL_INPUT_PATH = os.path.join(
-    MAIN_PATH, "Data", "datasets",
+    MAIN_PATH, "Data", "datasets", "synthetic",
     f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
     "spectral_input.csv"
 )
@@ -114,7 +114,7 @@ SIGMA_MIN = 0.3              # Peak widths: LogUniform(SIGMA_MIN, SIGMA_MAX)
 SIGMA_MAX = 3.0
 GENERATE_FRESH = False        # If True, generate new data; if False, load from disk
 USE_ON_THE_FLY = False       # If True, use on-the-fly dataset (infinite variety)
-SYNTHETIC_DATA_DIR = os.path.join(MAIN_PATH, "Data", "datasets", "synthetic-gaussian-pretrain")
+SYNTHETIC_DATA_DIR = os.path.join(MAIN_PATH, "Data", "datasets", "synthetic", "synthetic-gaussian-pretrain")
 
 PRE_EPOCHS = 100
 PRE_LR = 1e-3
@@ -258,11 +258,21 @@ def main():
     ).to(DEVICE)
     moment_fn = SpectralMomentLoss(W=SPECTRAL_W, N_gl=SPECTRAL_N_GL).to(DEVICE)
 
-    # --- Output directory — include sID to avoid overwriting previous runs ---
-    pre_out_dir = os.path.join(
-        MAIN_PATH, "out",
-        f"pretrain_synthetic_numpoles{NUM_POLES}-{sID}"
-    )
+    # --- Output directory — auto-increment run ID ---
+    _out_root       = os.path.join(MAIN_PATH, "out")
+    os.makedirs(_out_root, exist_ok=True)
+    _pre_base = f"pretrain_synthetic_numpoles{NUM_POLES}-pretrained-{_model_tag}"
+    _used_ids = [
+        int(d[len(_pre_base) + 1:])
+        for d in os.listdir(_out_root)
+        if os.path.isdir(os.path.join(_out_root, d))
+        and d.startswith(_pre_base + "-")
+        and d[len(_pre_base) + 1:].isdigit()
+    ]
+    _next_id    = max(_used_ids, default=0) + 1
+    sID         = f"pretrained-{_model_tag}-{_next_id}"
+    pre_out_dir = os.path.join(_out_root, f"pretrain_synthetic_numpoles{NUM_POLES}-{sID}")
+    print(f"Pretrain output directory: {pre_out_dir}")
     MakeOutPath(pre_out_dir)
 
     # --- Optimizer ---
@@ -350,9 +360,10 @@ def main():
     tag = "finetune"
 
     ft_out_dir = os.path.join(
-        MAIN_PATH, "out",
+        _out_root,
         f"finetune_{SPECTRAL_TYPE}_numpoles{NUM_POLES}_s{NOISE_S:.0e}_xi{NOISE_XI}-{sID}"
     )
+    print(f"Finetune output directory: {ft_out_dir}")
     MakeOutPath(ft_out_dir)
 
     # --- Save run parameters for reference ---

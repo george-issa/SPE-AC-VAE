@@ -37,47 +37,70 @@ import ana_cont.continuation as cont  # type: ignore
 # CONFIGURATION
 # ============================================================================
 
-MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
+MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# --- Dataset ---
+# --- Data source: "synthetic" or "real" ---
+DATA_SOURCE = "real"
+
+# --------------------------------------------------------------------------
+# Real QMC data (DATA_SOURCE = "real")
+# *** Only this line should change when uploading a new simulation folder ***
+# --------------------------------------------------------------------------
+QMC_SIM_DIR = os.path.join(
+    MAIN_PATH, "Data", "datasets", "real",
+    "hubbard_square_U8.00_mu0.00_L4_b6.00-1"
+)
+
+# --------------------------------------------------------------------------
+# Synthetic data (DATA_SOURCE = "synthetic")
+# --------------------------------------------------------------------------
 SPECTRAL_TYPE = "gaussian_double"
 INPUT_ID      = "inputs-8"
 NOISE_S       = 1e-04
 NOISE_XI      = 0.5
 DATA_PATH = os.path.join(
-    MAIN_PATH, "Data", "datasets",
+    MAIN_PATH, "Data", "datasets", "synthetic",
     f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
     f"Gbins_s{NOISE_S:.0e}_xi{NOISE_XI}.csv"
 )
 SPECTRAL_INPUT_PATH = os.path.join(
-    MAIN_PATH, "Data", "datasets",
+    MAIN_PATH, "Data", "datasets", "synthetic",
     f"half-filled-{SPECTRAL_TYPE}", INPUT_ID,
     "spectral_input.csv"
 )
 
-# --- Physical parameters (must match the dataset) ---
+# --- Physical parameters — auto-read from toml when DATA_SOURCE="real" ---
 BETA    = 10.0
 DTAU    = 0.05
-N_BINS  = None   # if None, inferred from CSV row count
+N_BINS  = None   # if None, inferred from data
 
 # --- Real-frequency grid for A(omega) ---
-N_OMEGA  = 500
-OMEGA_MIN = -8.0
-OMEGA_MAX =  8.0
+N_OMEGA   = 1000
+OMEGA_MIN = -20.0
+OMEGA_MAX =  20.0
 
 # --- MaxEnt solver settings ---
 ALPHA_START = 1e12
 ALPHA_END   = 1e-2
-PREBLUR     = False          # Gaussian broadening on A(omega) after solve
+PREBLUR     = False
 BLUR_WIDTH  = 0.5
 
 # --- Run mode ---
 MODE = 'mean'       # 'mean' or 'per_sample'
-N_SAMPLES = 50      # max samples to process in per_sample mode (None = all)
+N_SAMPLES = 50      # max samples in per_sample mode (None = all)
 
-# --- Output ---
-OUT_DIR = os.path.join(MAIN_PATH, "MaxEnt_benchmark", "out",
-                       f"anacont_{SPECTRAL_TYPE}_{INPUT_ID}_s{NOISE_S:.0e}")
+# --- Covariance mode (mean mode only) ---
+# True  — pass full (L_tau x L_tau) covariance matrix; more information but
+#         can be numerically unstable when many eigenvalues are near zero.
+# False — use diagonal SEM errors only; stabler and the standard MaxEnt approach.
+USE_FULL_COV = True
+
+# --- Output (set automatically from data source) ---
+if DATA_SOURCE == "real":
+    _out_tag = f"anacont_real-{os.path.basename(QMC_SIM_DIR)}"
+else:
+    _out_tag = f"anacont_{SPECTRAL_TYPE}_{INPUT_ID}_s{NOISE_S:.0e}"
+OUT_DIR = os.path.join(MAIN_PATH, "MaxEnt_benchmark", "out", _out_tag)
 
 # ============================================================================
 # HELPERS
@@ -150,7 +173,7 @@ def run_maxent(tau, omega, G_tau, beta, err=None, cov=None, preblur=False, blur_
 
     # Flat default model normalized to sum rule ∫A(ω)dω = 1
     model = np.ones_like(omega)
-    model /= np.trapz(model, omega)
+    model /= np.trapezoid(model, omega)
 
     probl = cont.AnalyticContinuationProblem(
         im_axis=tau,
@@ -195,12 +218,27 @@ def main():
     # ------------------------------------------------------------------
     # Load data
     # ------------------------------------------------------------------
-    print(f"Loading data from: {DATA_PATH}")
-    G_bins = load_data(DATA_PATH)
-    N_bins, L_tau = G_bins.shape
+    if DATA_SOURCE == "real":
+        from data_process_real import extract_greens_bins_v2, read_model_params  # type: ignore
+        print(f"Loading real QMC data from: {QMC_SIM_DIR}")
+        G_bins, _params = extract_greens_bins_v2(QMC_SIM_DIR, r1=0, r2=0)
+        beta  = _params["beta"]
+        dtau  = _params["dtau"]
+        L_tau = _params["L_tau"]
+        spectral_input_path = None
+        print(f"  beta={beta}, dtau={dtau}, L_tau={L_tau}")
+    else:
+        print(f"Loading synthetic data from: {DATA_PATH}")
+        G_bins = load_data(DATA_PATH)
+        beta   = BETA
+        dtau   = DTAU
+        L_tau  = G_bins.shape[1]
+        spectral_input_path = SPECTRAL_INPUT_PATH
+
+    N_bins = G_bins.shape[0]
     print(f"  {N_bins} bins x {L_tau} tau points")
 
-    tau   = np.linspace(0.0, BETA - DTAU, L_tau)
+    tau   = np.linspace(0.0, beta - dtau, L_tau)
     omega = np.linspace(OMEGA_MIN, OMEGA_MAX, N_OMEGA)
 
     # ------------------------------------------------------------------
@@ -215,13 +253,14 @@ def main():
     # Save run params
     # ------------------------------------------------------------------
     params = {
-        "DATA_PATH":            DATA_PATH,
-        "SPECTRAL_INPUT_PATH":  SPECTRAL_INPUT_PATH,
+        "DATA_SOURCE":          DATA_SOURCE,
+        "DATA_PATH":            QMC_SIM_DIR if DATA_SOURCE == "real" else DATA_PATH,
+        "SPECTRAL_INPUT_PATH":  spectral_input_path,
         "SPECTRAL_TYPE":        SPECTRAL_TYPE,
         "INPUT_ID":             INPUT_ID,
         "NOISE_S":              NOISE_S,
-        "BETA":                 BETA,
-        "DTAU":                 DTAU,
+        "BETA":                 beta,
+        "DTAU":                 dtau,
         "N_BINS":               N_bins,
         "L_TAU":                L_tau,
         "N_OMEGA":              N_OMEGA,
@@ -252,12 +291,12 @@ def main():
 
         print("Running MaxEnt (this may take ~30 s)...")
         A_opt, chi2, backtransform = run_maxent(
-            tau, omega, G_mean, BETA, cov=cov_mean,
+            tau, omega, G_mean, beta, cov=cov_mean,
             preblur=PREBLUR, blur_width=BLUR_WIDTH,
         )
 
         # Normalise A (should already integrate to ~1 by sum rule enforcement)
-        norm = np.trapz(A_opt, omega)
+        norm = np.trapezoid(A_opt, omega)
         print(f"  chi2 = {chi2:.4f},  ∫A dω = {norm:.4f}")
 
         np.savez(
@@ -268,10 +307,10 @@ def main():
             backtransform=backtransform,
             G_mean=G_mean,
             tau=tau,
-            beta=BETA,
+            beta=beta,
             sem_err=sem_diag,
             cov_mean=cov_mean,
-            spectral_input_path=SPECTRAL_INPUT_PATH,
+            spectral_input_path=spectral_input_path if spectral_input_path else "",
         )
         print(f"  Saved: {OUT_DIR}/summary_mean_fullcov.npz")
 
@@ -292,7 +331,7 @@ def main():
             if i % 10 == 0:
                 print(f"  sample {i+1}/{n_run} ...", flush=True)
             A_opt, chi2, bt = run_maxent(
-                tau, omega, G_bins[i], BETA, err=err,
+                tau, omega, G_bins[i], beta, err=err,
                 preblur=PREBLUR, blur_width=BLUR_WIDTH,
             )
             A_all[i]    = A_opt
@@ -300,7 +339,7 @@ def main():
             bt_all[i]   = bt
 
         print(f"\n  chi2: mean={chi2_all.mean():.4f}, min={chi2_all.min():.4f}, max={chi2_all.max():.4f}")
-        norm_all = np.trapz(A_all, omega, axis=1)
+        norm_all = np.trapezoid(A_all, omega, axis=1)
         print(f"  ∫A dω: mean={norm_all.mean():.4f}")
 
         np.savez(
@@ -312,9 +351,9 @@ def main():
             backtransform_all=bt_all,
             G_bins=G_bins[:n_run],
             tau=tau,
-            beta=BETA,
+            beta=beta,
             bin_err=err,
-            spectral_input_path=SPECTRAL_INPUT_PATH,
+            spectral_input_path=spectral_input_path if spectral_input_path else "",
         )
         print(f"  Saved: {OUT_DIR}/summary_samples.npz")
 

@@ -41,7 +41,7 @@ sys.path.insert(0, PROJ_ROOT)
 # CONFIGURATION
 # ============================================================================
 
-MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
+MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 OMEGAMAXENT_BIN = os.path.join(
     MAIN_PATH, "MaxEnt_benchmark", "OmegaMaxEnt", "build", "OmegaMaxEnt"
@@ -363,7 +363,7 @@ def main():
         )
 
     omega, A_opt = parse_optimal_spectrum(result_dir)
-    norm = float(np.trapz(A_opt, omega))
+    norm = float(np.trapezoid(A_opt, omega))
     print(f"\n  ∫A dω = {norm:.4f}  (fermionic sum rule: expected ~1.0)")
 
     # ------------------------------------------------------------------

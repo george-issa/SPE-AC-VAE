@@ -72,10 +72,39 @@ python pretrain/run_finetune.py
 | Pretraining epochs | 100 |
 | Fine-tuning epochs | 200 |
 
+## Setup
+
+### Python environment
+
+```bash
+conda env create -f environment.yml
+conda activate spe-ac-vae
+```
+
+### Julia environment
+
+Julia is required for reading/inspecting JLD2 data files. Install Julia first via [juliaup](https://julialang.org/downloads/):
+
+```bash
+curl -fsSL https://install.julialang.org | sh
+```
+
+Then install the Julia dependencies from the project environment:
+
+```bash
+julia --project=. -e "using Pkg; Pkg.instantiate()"
+```
+
 ## Dependencies
 
+**Python** (managed by `environment.yml`):
 - PyTorch
 - NumPy
 - SciPy
 - Matplotlib
 - tqdm
+- h5py
+
+**Julia** (managed by `Project.toml`):
+- JLD2.jl
+- HDF5.jl

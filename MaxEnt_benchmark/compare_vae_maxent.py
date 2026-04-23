@@ -43,40 +43,47 @@ plt.rcParams.update({
 PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ_ROOT)
 
+from pretrain.plot_results import _build_loss_annotation  # type: ignore
+
 # ============================================================================
 # CONFIGURATION — update these paths after running the two MaxEnt scripts
 # ============================================================================
 
-MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
+MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MB_PATH   = os.path.join(MAIN_PATH, "MaxEnt_benchmark")
 
 # VAE run to compare against
 # Set to None to skip any method
 VAE_SUMMARY = os.path.join(
     MAIN_PATH, "out",
-    "finetune_gaussian_double_numpoles6_s1e-04_xi0.5-fresh-v2L-2",
+    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles3-fresh-v2L-1",
     "summary.pt"
 )
 
 # ana_cont MaxEnt summary (produced by run_anacont_maxent.py, MODE='mean')
 ANACONT_SUMMARY = os.path.join(
     MB_PATH, "out",
-    "anacont_gaussian_double_inputs-8_s1e-04",
+    "anacont_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1",
     "summary_mean_fullcov.npz"
 )
 
 # OmegaMaxEnt summary (produced by run_omegamaxent.py) — set to None to skip
-OMEGAMAXENT_SUMMARY = os.path.join(
-    MB_PATH, "out",
-    "omegamaxent_gaussian_double_inputs-8_s1e-04",
-    "summary.npz"
-)
+OMEGAMAXENT_SUMMARY = None
 
 # Samples to highlight in per-sample panels
 SAMPLE_INDICES = [0, 1, 2, 3]
 
-# Output directory
-COMPARE_OUT_DIR = os.path.join(MB_PATH, "out", "comparison_vae_maxent")
+# Output directory — derived automatically from VAE folder name:
+#   finetune_real-{sim}_numpoles{N}-{fresh|pretrained}-{model}-{sID}
+#   → comparison_real-{sim}_numpoles{N}-{fresh|pretrained}-{sID}
+import re as _re
+_vae_folder = os.path.basename(os.path.dirname(VAE_SUMMARY)) if VAE_SUMMARY else ""
+_m = _re.match(r"finetune_real-(.+?)(_numpoles\d+)-(fresh|pretrained)-.+-?(\d+)$", _vae_folder)
+if _m:
+    _compare_tag = f"comparison_real-{_m.group(1)}{_m.group(2)}-{_m.group(3)}-{_m.group(4)}"
+else:
+    _compare_tag = f"comparison_{_vae_folder}"
+COMPARE_OUT_DIR = os.path.join(MB_PATH, "out", _compare_tag)
 
 # ============================================================================
 # LOADERS
@@ -93,19 +100,45 @@ def load_ground_truth(spectral_input_path):
 
 
 def load_vae(summary_path):
-    """Load VAE summary.pt. Returns dict with keys: omega, A_mean [N,Nw], etc."""
+    """Load VAE summary.pt. Returns dict with keys: omega, A_mean [N,Nw], etc.
+
+    Supports both old summary.pt (with precomputed omega_eval_grid / A_mean)
+    and new summary.pt (poles + residues only — A_mean computed on the fly).
+    """
     if summary_path is None or not os.path.exists(summary_path):
         return None
     s = torch.load(summary_path, weights_only=False)
+
+    if "omega_eval_grid" in s and "A_mean" in s:
+        omega  = s["omega_eval_grid"].numpy()
+        A_mean = s["A_mean"].numpy()          # (N, Nw)
+    else:
+        # Derive from poles/residues deterministically (z = mu)
+        from pretrain.pretrain_losses import spectral_from_poles  # type: ignore
+        poles    = s["poles"]
+        residues = s["residues"]
+        omega_t  = torch.linspace(-20.0, 20.0, 1000)
+        with torch.no_grad():
+            A_mean = spectral_from_poles(poles, residues, omega_t).numpy()
+        omega = omega_t.numpy()
+
+    params_path = os.path.join(os.path.dirname(summary_path), "params.json")
+    params = {}
+    if os.path.exists(params_path):
+        with open(params_path) as _f:
+            params = json.load(_f)
+
     return {
-        "omega":               s["omega_eval_grid"].numpy(),
-        "A_mean":              s["A_mean"].numpy(),           # (N, Nw)
-        "A_avg":               s["A_mean"].numpy().mean(0),   # (Nw,)
-        "G_input":             s["inputs"].numpy(),           # (N, L)
-        "G_recon":             s["recon"].numpy(),            # (N, L)
+        "omega":               omega,
+        "A_mean":              A_mean,
+        "A_avg":               A_mean.mean(0),
+        "G_input":             s["inputs"].numpy(),
+        "G_recon":             s["recon"].numpy(),
         "beta":                float(s["beta"]),
         "Ltau":                int(s["Ltau"]),
+        "num_poles":           int(s["num_poles"]) if "num_poles" in s else None,
         "spectral_input_path": str(s.get("spectral_input_path", "")),
+        "params":              params,
     }
 
 
@@ -148,7 +181,7 @@ def load_omegamaxent(npz_path):
 def l2_error(omega, A_pred, A_gt_on_omega):
     """L2 norm of (A_pred - A_gt), integrated over omega."""
     diff = A_pred - A_gt_on_omega
-    return float(np.sqrt(np.trapz(diff ** 2, omega)))
+    return float(np.sqrt(np.trapezoid(diff ** 2, omega)))
 
 
 def linf_error(A_pred, A_gt_on_omega):
@@ -168,25 +201,68 @@ def compute_chi2(G_recon, G_input, C_inv):
 # PLOTS
 # ============================================================================
 
-def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path):
-    """Dataset-averaged A(omega): VAE + MaxEnt methods + ground truth."""
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(9, 7),
-        gridspec_kw={"height_ratios": [3, 1]},
-        sharex=True,
+def _make_model_title(sim_name):
+    """Parse a simulation folder name into a formatted LaTeX title string."""
+    import re as _re
+    if sim_name is None:
+        return None
+    _m_hubbard = _re.search(
+        r"hubbard.*_U(?P<U>[\d.]+)_mu(?P<mu>[\d.]+)_L(?P<L>\d+)_b(?P<b>[\d.]+)",
+        sim_name,
     )
+    _m_holstein = _re.search(
+        r"w(?P<w>[\d.]+)_a(?P<a>[\d.]+)_b(?P<b>[\d.]+)_L(?P<L>\d+)",
+        sim_name,
+    )
+    if _m_hubbard:
+        return (
+            rf"Hubbard: $U={_m_hubbard.group('U')}$, "
+            rf"$\mu={_m_hubbard.group('mu')}$, "
+            rf"$\beta={_m_hubbard.group('b')}$, "
+            rf"$L={_m_hubbard.group('L')}$"
+        )
+    elif _m_holstein:
+        return (
+            rf"Bond-Holstein: $\omega={_m_holstein.group('w')}$, "
+            rf"$\alpha={_m_holstein.group('a')}$, "
+            rf"$\beta={_m_holstein.group('b')}$, "
+            rf"$L={_m_holstein.group('L')}$"
+        )
+    return sim_name.replace("_", r"\_")
+
+
+def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path, sim_name=None):
+    """Dataset-averaged A(omega): VAE + MaxEnt methods + ground truth.
+
+    Difference panel (ΔA) is only shown when ground truth is available.
+    """
+    has_gt = A_gt is not None
+
+    if has_gt:
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(9, 7),
+            gridspec_kw={"height_ratios": [3, 1]},
+            sharex=True,
+        )
+    else:
+        fig, ax1 = plt.subplots(figsize=(9, 5))
+
+    model_title = _make_model_title(sim_name)
+    if model_title:
+        num_poles = vae["num_poles"] if vae is not None else None
+        if num_poles is not None:
+            model_title += rf"~~$|$~~{num_poles} poles (VAE)"
+        fig.suptitle(model_title, fontsize=13, y=1.01)
 
     # Ground truth
-    if A_gt is not None:
+    if has_gt:
         ax1.fill_between(omega_gt, A_gt, alpha=0.12, color="tab:green")
         ax1.plot(omega_gt, A_gt, color="tab:green", lw=1.8, alpha=0.9,
                  label=r"Ground truth")
 
     # VAE
     if vae is not None:
-        A_vae_avg = vae["A_avg"]
-        omega_v   = vae["omega"]
-        ax1.plot(omega_v, A_vae_avg, color="tab:blue", lw=1.8,
+        ax1.plot(vae["omega"], vae["A_avg"], color="tab:blue", lw=1.8,
                  label=r"VAE-AC $\langle A(\omega)\rangle$")
 
     # ana_cont MaxEnt
@@ -205,34 +281,36 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path):
     ax1.set_title(r"Spectral function $A(\omega)$: VAE vs MaxEnt", fontsize=12, pad=6)
     ax1.legend(loc="upper right")
     ax1.grid(True, alpha=0.3)
+    if not has_gt:
+        ax1.set_xlabel(r"$\omega$")
 
-    # Difference panel
-    ax2.axhline(0, color="gray", lw=0.8, alpha=0.5)
-    if A_gt is not None:
+    # Difference panel — only when ground truth is available
+    if has_gt:
+        ax2.axhline(0, color="gray", lw=0.8, alpha=0.5)
         if vae is not None:
-            omega_v = vae["omega"]
-            gt_interp = np.interp(omega_v, omega_gt, A_gt)
-            diff_v    = vae["A_avg"] - gt_interp
-            ax2.plot(omega_v, diff_v, color="tab:blue", lw=1.2, label="VAE")
-            ax2.fill_between(omega_v, diff_v, alpha=0.20, color="tab:blue")
+            gt_interp = np.interp(vae["omega"], omega_gt, A_gt)
+            diff_v = vae["A_avg"] - gt_interp
+            ax2.plot(vae["omega"], diff_v, color="tab:blue", lw=1.2, label="VAE")
+            ax2.fill_between(vae["omega"], diff_v, alpha=0.20, color="tab:blue")
         if anacont is not None:
-            omega_m = anacont["omega"]
-            gt_interp_m = np.interp(omega_m, omega_gt, A_gt)
+            gt_interp_m = np.interp(anacont["omega"], omega_gt, A_gt)
             diff_m = anacont["A_opt"] - gt_interp_m
-            ax2.plot(omega_m, diff_m, color="tab:orange", lw=1.2, ls="--",
-                     label="ana\_cont")
-            ax2.fill_between(omega_m, diff_m, alpha=0.20, color="tab:orange")
+            ax2.plot(anacont["omega"], diff_m, color="tab:orange", lw=1.2, ls="--",
+                     label=r"ana\_cont")
+            ax2.fill_between(anacont["omega"], diff_m, alpha=0.20, color="tab:orange")
         if omegamaxent is not None:
-            omega_o = omegamaxent["omega"]
-            gt_interp_o = np.interp(omega_o, omega_gt, A_gt)
+            gt_interp_o = np.interp(omegamaxent["omega"], omega_gt, A_gt)
             diff_o = omegamaxent["A_opt"] - gt_interp_o
-            ax2.plot(omega_o, diff_o, color="tab:red", lw=1.2, ls="-.",
+            ax2.plot(omegamaxent["omega"], diff_o, color="tab:red", lw=1.2, ls="-.",
                      label="OmegaMaxEnt")
-            ax2.fill_between(omega_o, diff_o, alpha=0.20, color="tab:red")
+            ax2.fill_between(omegamaxent["omega"], diff_o, alpha=0.20, color="tab:red")
         ax2.legend(fontsize=9, loc="upper right")
-    ax2.set_ylabel(r"$\Delta A(\omega)$")
-    ax2.set_xlabel(r"$\omega$")
-    ax2.grid(True, alpha=0.3)
+        ax2.set_ylabel(r"$\Delta A(\omega)$")
+        ax2.set_xlabel(r"$\omega$")
+        ax2.grid(True, alpha=0.3)
+
+    if vae is not None and vae.get("params"):
+        _build_loss_annotation(fig, vae["params"])
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -351,7 +429,11 @@ def plot_gtau(vae, anacont, omegamaxent, sample_indices, out_path):
 
 
 def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
-    """Compute and save comparison metrics to text and JSON."""
+    """Compute and save comparison metrics to text and JSON.
+
+    L2 and L∞ errors are only computed and shown when ground truth is available.
+    """
+    has_gt = A_gt is not None and omega_gt is not None
     rows = []
 
     for label, method_data, omega_key, A_key in [
@@ -363,34 +445,34 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
             continue
         omega_m = method_data[omega_key]
         A_m     = method_data[A_key]
-        norm    = float(np.trapz(A_m, omega_m))
-
-        if A_gt is not None and omega_gt is not None:
-            gt_interp = np.interp(omega_m, omega_gt, A_gt)
-            l2  = l2_error(omega_m, A_m, gt_interp)
-            linf = linf_error(A_m, gt_interp)
-        else:
-            l2  = float("nan")
-            linf = float("nan")
-
+        norm    = float(np.trapezoid(A_m, omega_m))
         chi2_val = method_data.get("chi2", float("nan"))
 
-        rows.append({
-            "method":   label,
-            "norm":     round(norm, 4),
-            "L2_error": round(l2,   5),
-            "Linf_error": round(linf, 5),
-            "chi2":     round(chi2_val, 5) if not np.isnan(chi2_val) else None,
-        })
+        row = {
+            "method": label,
+            "norm":   round(norm, 4),
+            "chi2":   round(chi2_val, 5) if not np.isnan(chi2_val) else None,
+        }
+        if has_gt:
+            gt_interp = np.interp(omega_m, omega_gt, A_gt)
+            row["L2_error"]   = round(l2_error(omega_m, A_m, gt_interp), 5)
+            row["Linf_error"] = round(linf_error(A_m, gt_interp), 5)
+        rows.append(row)
 
     # Print table
-    header = f"\n{'Method':<30} {'Norm':>8} {'L2 err':>10} {'Linf err':>10} {'chi2':>8}"
+    if has_gt:
+        header = f"\n{'Method':<30} {'Norm':>8} {'L2 err':>10} {'Linf err':>10} {'chi2':>8}"
+    else:
+        header = f"\n{'Method':<30} {'Norm':>8} {'chi2':>8}"
     print(header)
     print("=" * len(header.lstrip("\n")))
     for r in rows:
         chi2_str = f"{r['chi2']:.5f}" if r["chi2"] is not None else "   n/a"
-        print(f"{r['method']:<30} {r['norm']:>8.4f} {r['L2_error']:>10.5f} "
-              f"{r['Linf_error']:>10.5f} {chi2_str:>8}")
+        if has_gt:
+            print(f"{r['method']:<30} {r['norm']:>8.4f} {r['L2_error']:>10.5f} "
+                  f"{r['Linf_error']:>10.5f} {chi2_str:>8}")
+        else:
+            print(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8}")
     print()
 
     # Save
@@ -400,8 +482,11 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
         f.write("=" * len(header.lstrip("\n")) + "\n")
         for r in rows:
             chi2_str = f"{r['chi2']:.5f}" if r["chi2"] is not None else "   n/a"
-            f.write(f"{r['method']:<30} {r['norm']:>8.4f} {r['L2_error']:>10.5f} "
-                    f"{r['Linf_error']:>10.5f} {chi2_str:>8}\n")
+            if has_gt:
+                f.write(f"{r['method']:<30} {r['norm']:>8.4f} {r['L2_error']:>10.5f} "
+                        f"{r['Linf_error']:>10.5f} {chi2_str:>8}\n")
+            else:
+                f.write(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8}\n")
     json_path = os.path.join(out_dir, "metrics.json")
     with open(json_path, "w") as f:
         json.dump(rows, f, indent=2)
@@ -412,28 +497,34 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
 
 
 def plot_metrics_bar(rows, out_path):
-    """Bar chart comparing Norm, L2 error, and L∞ error across methods."""
+    """Bar chart of metrics. L2/L∞ panels only shown when ground truth is available."""
     if not rows:
         return
 
-    methods  = [r["method"] for r in rows]
-    norms    = [r["norm"]       for r in rows]
-    l2s      = [r["L2_error"]   for r in rows]
-    linfs    = [r["Linf_error"] for r in rows]
+    has_gt = "L2_error" in rows[0]
+    methods = [r["method"] for r in rows]
+    norms   = [r["norm"]   for r in rows]
+    n       = len(methods)
+    x       = np.arange(n)
+    colors  = ["tab:blue", "tab:orange", "tab:red"][:n]
 
-    n      = len(methods)
-    x      = np.arange(n)
-    colors = ["tab:blue", "tab:orange", "tab:red"][:n]
+    if has_gt:
+        l2s   = [r["L2_error"]   for r in rows]
+        linfs = [r["Linf_error"] for r in rows]
+        panels_def = [
+            (norms, r"Norm $\int A(\omega)\,d\omega$", 1.0),
+            (l2s,   r"$L^2$ error",                    None),
+            (linfs, r"$L^\infty$ error",               None),
+        ]
+        fig, axes = plt.subplots(1, 3, figsize=(11, 4))
+    else:
+        panels_def = [
+            (norms, r"Norm $\int A(\omega)\,d\omega$", 1.0),
+        ]
+        fig, axes_raw = plt.subplots(1, 1, figsize=(5, 4))
+        axes = [axes_raw]
 
-    fig, axes = plt.subplots(1, 3, figsize=(11, 4))
-
-    panels = [
-        (axes[0], norms,  r"Norm $\int A(\omega)\,d\omega$",  1.0),
-        (axes[1], l2s,    r"$L^2$ error",                     None),
-        (axes[2], linfs,  r"$L^\infty$ error",                None),
-    ]
-
-    for ax, values, ylabel, hline in panels:
+    for ax, (values, ylabel, hline) in zip(axes, panels_def):
         bars = ax.bar(x, values, color=colors, width=0.5, alpha=0.85,
                       edgecolor="black", linewidth=0.7)
         if hline is not None:
@@ -507,9 +598,11 @@ def main():
     # Plots
     # ------------------------------------------------------------------
     print("\nGenerating plots...")
+    _sim_name = os.path.basename(COMPARE_OUT_DIR).replace("comparison_real-", "")
     plot_spectral_avg(
         vae, anacont, omegamaxent, omega_gt, A_gt,
         os.path.join(COMPARE_OUT_DIR, "spectral_avg.pdf"),
+        sim_name=_sim_name,
     )
     plot_spectral_samples(
         vae, anacont, omegamaxent, omega_gt, A_gt,

@@ -59,11 +59,17 @@ COLORS = {
 # ---------------------------------------------------------------------------
 
 def _fmt_val(v):
-    """Format a loss weight for display: 0 → OFF, small/large → sci notation."""
+    """Format a loss weight for display: 0 → OFF, small/large → LaTeX sci notation."""
     if v == 0:
-        return "OFF"
+        return r"\mathrm{OFF}"
     if abs(v) < 0.01 or abs(v) >= 1000:
-        return f"{v:.1e}"
+        s = f"{v:.2e}"
+        mantissa, exp = s.split("e")
+        mantissa = mantissa.rstrip("0").rstrip(".")
+        exp_int = int(exp)
+        if mantissa in ("1", "-1"):
+            return rf"10^{{{exp_int}}}" if mantissa == "1" else rf"-10^{{{exp_int}}}"
+        return rf"{mantissa}\!\times\!10^{{{exp_int}}}"
     return f"{v:g}"
 
 
@@ -78,9 +84,7 @@ def _build_loss_annotation(fig, params):
         parts.append(rf"\texttt{{{tex(params['sID'])}}}")
     if params.get("MODEL_VERSION"):
         parts.append(rf"model~v{tex(params['MODEL_VERSION'])}")
-    if params.get("NUM_POLES"):
-        parts.append(rf"{params['NUM_POLES']}~poles")
-    if params.get("SPECTRAL_TYPE"):
+    if params.get("SPECTRAL_TYPE") and params.get("DATA_SOURCE") != "real":
         s = tex(params["SPECTRAL_TYPE"])
         ns = params.get("NOISE_S")
         noise_str = rf",~$s={ns:.0e}$" if isinstance(ns, float) else ""
@@ -521,7 +525,7 @@ def plot_poles_residues(poles, residues, n_samples=6, save_path=None):
 # ---------------------------------------------------------------------------
 
 def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
-                            n_samples=6, wmin=-8, wmax=8, Nw=1000, save_path=None):
+                            n_samples=6, wmin=-20, wmax=20, Nw=1000, save_path=None):
     """Plot predicted A(omega) from poles/residues for selected samples,
     overlaid with ground truth if available.
 
@@ -597,7 +601,7 @@ def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
 
 
 def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
-                          wmin=-8, wmax=8, Nw=1000, save_path=None):
+                          wmin=-20, wmax=20, Nw=1000, suptitle=None, save_path=None):
     """Plot the average predicted A(omega) with ground truth overlay and difference.
 
     Two panels:
@@ -691,6 +695,8 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
         )
         ax2.grid(True, alpha=0.3)
 
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=13, y=1.02)
     plt.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
@@ -841,6 +847,62 @@ def plot_finetune_eval(summary_file, output_dir=None):
             print(f"WARNING: spectral_input_path not found: {spec_path}")
 
     noise_var = d.get("noise_var", None)
+
+    # --- Build physical model title from saved metadata or folder name ---
+    import re as _re
+    _title_parts = []
+
+    # sim_name: from summary.pt (new runs) or parsed from the output folder path (old runs)
+    sim_name = d.get("sim_name", None)
+    if sim_name is None:
+        # Fall back: extract sim name from the output folder name
+        # Folder pattern: finetune_real-{sim_name}_numpoles{P}-{sID}
+        _folder = os.path.basename(os.path.dirname(summary_file))
+        _fm = _re.search(r"finetune_real-(.+?)_numpoles(\d+)-(.+)$", _folder)
+        if _fm:
+            sim_name  = _fm.group(1)
+            if d.get("num_poles") is None:
+                d["num_poles"] = int(_fm.group(2))
+            if d.get("sID") is None:
+                d["sID"] = _fm.group(3)
+
+    if sim_name:
+        _m_holstein = _re.search(
+            r"w(?P<w>[\d.]+)_a(?P<a>[\d.]+)_b(?P<b>[\d.]+)_L(?P<L>\d+)",
+            sim_name
+        )
+        _m_hubbard = _re.search(
+            r"hubbard.*_U(?P<U>[\d.]+)_mu(?P<mu>[\d.]+)_L(?P<L>\d+)_b(?P<b>[\d.]+)",
+            sim_name
+        )
+        if _m_holstein:
+            _title_parts.append(
+                rf"Bond-Holstein: $\omega={_m_holstein.group('w')}$, "
+                rf"$\alpha={_m_holstein.group('a')}$, "
+                rf"$\beta={_m_holstein.group('b')}$, "
+                rf"$L={_m_holstein.group('L')}$"
+            )
+        elif _m_hubbard:
+            _title_parts.append(
+                rf"Hubbard: $U={_m_hubbard.group('U')}$, "
+                rf"$\mu={_m_hubbard.group('mu')}$, "
+                rf"$\beta={_m_hubbard.group('b')}$, "
+                rf"$L={_m_hubbard.group('L')}$"
+            )
+        else:
+            _title_parts.append(sim_name.replace("_", r"\_"))
+    else:
+        _title_parts.append(rf"$\beta={beta:.2f}$")
+
+    num_poles = d.get("num_poles", None)
+    sID_str   = d.get("sID", None)
+    if num_poles:
+        _title_parts.append(rf"{num_poles} poles")
+    if sID_str:
+        _sID_escaped = sID_str.replace("_", r"\_")
+        _title_parts.append(rf"\texttt{{{_sID_escaped}}}")
+    _spectral_suptitle = r"~$|$~".join(_title_parts)
+
     plot_gtau_comparison(G_input, G_recon, beta, n_samples=6, noise_var=noise_var,
                          save_path=os.path.join(output_dir, "gtau_comparison.pdf"))
 
@@ -856,18 +918,8 @@ def plot_finetune_eval(summary_file, output_dir=None):
     # Average A(omega) with ground truth overlay and difference
     plot_spectral_average(poles, residues,
                           A_input=A_input, omega_input=omega_input,
+                          suptitle=_spectral_suptitle,
                           save_path=os.path.join(output_dir, "spectral_average.pdf"))
-
-    # MC uncertainty band (if multi-sample eval was run)
-    if "A_mean" in d and "A_std" in d and "omega_eval_grid" in d:
-        A_mean_np = d["A_mean"].numpy()
-        A_std_np  = d["A_std"].numpy()
-        omega_np  = d["omega_eval_grid"].numpy()
-        n_mc = d.get("n_mc", None)
-        plot_spectral_mc(A_mean_np, A_std_np, omega_np,
-                         A_input=A_input, omega_input=omega_input,
-                         n_mc=n_mc,
-                         save_path=os.path.join(output_dir, "spectral_mc_uncertainty.pdf"))
 
     # Average G(tau)
     fig, ax = plt.subplots(figsize=(8, 5))

@@ -22,7 +22,7 @@ from pretrain.synthetic_data import generate_and_save  # type: ignore
 # CONFIG — edit these values to run without command-line arguments
 # ===========================================================================
 
-MAIN_PATH = "/Users/georgeissa/Documents/AC/SPE-AC-VAE"
+MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Dataset size
 N = 1000
@@ -40,13 +40,13 @@ DTAU      = 0.05
 
 # Output directory
 OUTPUT_DIR = os.path.join(
-    MAIN_PATH, "Data", "datasets", "synthetic-gaussian-pretrain"
+    MAIN_PATH, "Data", "datasets", "synthetic", "synthetic-gaussian-pretrain"
 )
 
 # Covariance source: path to a DQMC Gbins CSV so chi-squared uses real noise structure.
 # Set to None to fall back to the signal covariance (last resort only).
 COVARIANCE_SOURCE = os.path.join(
-    MAIN_PATH, "Data", "datasets",
+    MAIN_PATH, "Data", "datasets", "synthetic",
     "half-filled-gaussian_double", "inputs-8",
     "Gbins_s1e-04_xi0.5.csv"
 )

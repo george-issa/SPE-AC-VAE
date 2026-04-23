@@ -139,6 +139,11 @@ def train_finetune(
 
             optimizer.zero_grad()
             loss.backward()
+            if not torch.isfinite(loss):
+                print(f"  WARNING: non-finite loss ({loss.item():.3e}) at epoch {epoch+1}, skipping update")
+                optimizer.zero_grad()
+                continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
 
             train_loss      += loss.item()          * B
