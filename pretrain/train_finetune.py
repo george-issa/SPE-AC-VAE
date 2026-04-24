@@ -102,6 +102,13 @@ def train_finetune(
     counter = 0
     best_epoch = -1
 
+    # Running EMA of successful-step loss, used to catch anomalous batches
+    # before their gradients corrupt the weights. Persists across epochs.
+    ema_loss = None
+    EMA_BETA = 0.95
+    LOSS_RATIO_THRESHOLD = 100.0   # skip if loss > 100 * ema_loss
+    ABS_LOSS_FLOOR = 100.0         # floor so early batches are not over-sensitive
+
     for epoch in range(num_epochs):
 
         print(f"{'-'*75} {tag} Epoch {epoch + 1} {'-'*50}")
@@ -138,13 +145,31 @@ def train_finetune(
             )
 
             optimizer.zero_grad()
+
+            # Pre-backward: anomaly guard on the loss value itself.
+            loss_val = loss.item()
+            ema_threshold = (
+                max(ABS_LOSS_FLOOR, LOSS_RATIO_THRESHOLD * ema_loss)
+                if ema_loss is not None else float("inf")
+            )
+            if not torch.isfinite(loss) or loss_val > ema_threshold:
+                ema_str = f"{ema_loss:.3e}" if ema_loss is not None else "N/A"
+                print(f"  WARNING: loss anomaly ({loss_val:.3e}, ema={ema_str}) at epoch {epoch+1}, skipping update")
+                continue
+
             loss.backward()
-            if not torch.isfinite(loss):
-                print(f"  WARNING: non-finite loss ({loss.item():.3e}) at epoch {epoch+1}, skipping update")
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
+            # Post-backward: catch non-finite gradients before they hit the optimizer state.
+            if not torch.isfinite(grad_norm):
+                print(f"  WARNING: non-finite grad norm ({grad_norm}) at epoch {epoch+1}, skipping update")
                 optimizer.zero_grad()
                 continue
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
             optimizer.step()
+
+            # Update EMA only on accepted steps so a bad batch cannot pull the threshold up.
+            ema_loss = loss_val if ema_loss is None else EMA_BETA * ema_loss + (1 - EMA_BETA) * loss_val
 
             train_loss      += loss.item()          * B
             epoch_chi2      += chi2_val.item()      * B
@@ -163,6 +188,10 @@ def train_finetune(
                 kl=kl_val.item(),
                 total=loss.item(),
             )
+
+        if n_samples == 0:
+            print(f"  All batches skipped at epoch {epoch+1} — model diverged. Stopping; best checkpoint preserved.")
+            break
 
         train_loss       /= n_samples
         train_losses.append(train_loss)
@@ -184,8 +213,10 @@ def train_finetune(
                 B = batch.shape[0]
                 batch = batch.view(B, input_dim).to(device)
 
+                # Validation always uses z = mu (no reparameterization noise) so
+                # val_loss is a clean signal for the scheduler / early stopping.
                 mu, logvar, z, poles, residues, Gtau_reconstructed = model(
-                    batch, deterministic=deterministic
+                    batch, deterministic=True
                 )
 
                 loss, _, _, _, _, _, _, _ = finetune_total_loss(
