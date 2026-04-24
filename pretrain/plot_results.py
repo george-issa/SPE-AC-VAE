@@ -601,7 +601,8 @@ def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
 
 
 def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
-                          wmin=-20, wmax=20, Nw=1000, suptitle=None, save_path=None):
+                          wmin=-20, wmax=20, Nw=1000, suptitle=None, save_path=None,
+                          poles_from_avg=None, residues_from_avg=None):
     """Plot the average predicted A(omega) with ground truth overlay and difference.
 
     Two panels:
@@ -634,6 +635,17 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
     A_mean = A_all.mean(axis=0)
     A_std = A_all.std(axis=0)
 
+    A_from_avg = None
+    if poles_from_avg is not None and residues_from_avg is not None:
+        if not isinstance(poles_from_avg, torch.Tensor):
+            poles_from_avg = torch.tensor(poles_from_avg)
+        if not isinstance(residues_from_avg, torch.Tensor):
+            residues_from_avg = torch.tensor(residues_from_avg)
+        with torch.no_grad():
+            A_from_avg = spectral_from_poles(
+                poles_from_avg.unsqueeze(0), residues_from_avg.unsqueeze(0), omegas
+            ).squeeze(0).numpy()
+
     # Average pole positions
     eps_mean = poles.real.mean(dim=0).numpy()
 
@@ -658,6 +670,10 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
                      alpha=0.2, color=COLORS["pred"],
                      label=r"$\pm 1\sigma$ (variation across dataset samples)")
 
+    if A_from_avg is not None:
+        ax1.plot(omegas_np, A_from_avg, ":", color="#8E24AA", linewidth=2,
+                 label=r"$A(\omega \mid \langle G(\tau)\rangle)$ (single forward pass)")
+
     for p in range(len(eps_mean)):
         ax1.axvline(eps_mean[p], color=COLORS["pole_re"], linestyle="--",
                     alpha=0.5, linewidth=1.0,
@@ -675,7 +691,8 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
         A_input_interp = np.interp(omegas_np, omega_input, A_input)
         diff = A_mean - A_input_interp
 
-        ax2.plot(omegas_np, diff, "-", color="#D32F2F", linewidth=1.5)
+        ax2.plot(omegas_np, diff, "-", color="#D32F2F", linewidth=1.5,
+                 label=r"$\langle A\rangle - A_\mathrm{in}$")
         ax2.fill_between(omegas_np, diff, alpha=0.2, color="#D32F2F")
         ax2.axhline(y=0, color="gray", linestyle="-", alpha=0.5)
 
@@ -685,14 +702,24 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
         int_sq_err = np.sqrt(np.sum(diff ** 2) * dw)
         max_abs_err = np.max(np.abs(diff))
 
+        title = (rf"$\int |{{\Delta A}}| d\omega = {int_abs_err:.4f}$, "
+                 rf"$\sqrt{{\int {{\Delta A}}^2 d\omega}} = {int_sq_err:.4f}$, "
+                 rf"$\max |{{\Delta A}}| = {max_abs_err:.4f}$")
+
+        if A_from_avg is not None:
+            diff_avg = A_from_avg - A_input_interp
+            ax2.plot(omegas_np, diff_avg, ":", color="#8E24AA", linewidth=1.5,
+                     label=r"$A(\langle G\rangle) - A_\mathrm{in}$")
+            int_abs_avg = np.sum(np.abs(diff_avg)) * dw
+            int_sq_avg  = np.sqrt(np.sum(diff_avg ** 2) * dw)
+            title += (rf"   |   from $\langle G\rangle$: "
+                      rf"$\int|\Delta A|d\omega = {int_abs_avg:.4f}$, "
+                      rf"$\sqrt{{\int \Delta A^2 d\omega}} = {int_sq_avg:.4f}$")
+            ax2.legend(fontsize=9, loc="upper right")
+
         ax2.set_xlabel(r"$\omega$")
         ax2.set_ylabel(r"$\Delta A(\omega)$")
-        ax2.set_title(
-            rf"Difference (pred $-$ input): "
-            rf"$\int |{{\Delta A}}| d\omega = {int_abs_err:.4f}$, "
-            rf"$\sqrt{{\int {{\Delta A}}^2 d\omega}} = {int_sq_err:.4f}$, "
-            rf"$\max |{{\Delta A}}| = {max_abs_err:.4f}$"
-        )
+        ax2.set_title(title)
         ax2.grid(True, alpha=0.3)
 
     if suptitle:
@@ -919,6 +946,8 @@ def plot_finetune_eval(summary_file, output_dir=None):
     plot_spectral_average(poles, residues,
                           A_input=A_input, omega_input=omega_input,
                           suptitle=_spectral_suptitle,
+                          poles_from_avg=d.get("poles_from_avg"),
+                          residues_from_avg=d.get("residues_from_avg"),
                           save_path=os.path.join(output_dir, "spectral_average.pdf"))
 
     # Average G(tau)
@@ -928,7 +957,10 @@ def plot_finetune_eval(summary_file, output_dir=None):
     ax.plot(taus, d["inputs_avg"].numpy(), "o", color=COLORS["input"],
             markersize=3, alpha=0.6, label="Input (avg)")
     ax.plot(taus, d["recon_avg"].numpy(), "-", color=COLORS["recon"],
-            linewidth=2, label="Reconstructed (avg)")
+            linewidth=2, label=r"$\langle$Reconstructed$\rangle$ (avg of recon)")
+    if "recon_from_avg" in d and d["recon_from_avg"] is not None:
+        ax.plot(taus, d["recon_from_avg"].numpy(), ":", color="#8E24AA",
+                linewidth=2, label=r"Reconstructed from $\langle G\rangle$ (single pass)")
     ax.set_xlabel(r"$\tau$")
     ax.set_ylabel(r"$G(\tau)$")
     ax.set_title(r"Average $G(\tau)$ Reconstruction")

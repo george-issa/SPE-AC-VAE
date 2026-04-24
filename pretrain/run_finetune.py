@@ -87,7 +87,7 @@ DATA_SOURCE = "real"   # switch between synthetic CSV and real QMC JLD2
 
 # --- Model ---
 LOAD_PRETRAIN = False
-NUM_POLES = 3
+NUM_POLES = 20
 N_NODES = 256
 BATCH_SIZE = 10
 
@@ -139,7 +139,7 @@ PRETRAIN_DIR = os.path.join(
 PRETRAIN_CHECKPOINT = os.path.join(PRETRAIN_DIR, "model", "best_model_pretrain.pth")
 
 # --- Fine-tuning hyperparameters ---
-FINETUNE_EPOCHS = 1000
+FINETUNE_EPOCHS = 400
 FINETUNE_LR = 1e-3        
 FINETUNE_PATIENCE = FINETUNE_EPOCHS + 1              # Early stopping enabled with a wide window
 FINETUNE_KL_ANNEAL_EPOCHS = 0
@@ -154,10 +154,12 @@ ETA0 = 1.0              # G(tau) >= 0 penalty — variance-weighted via diag(C)
 ETA2 = 1.0              # G''(tau) >= 0 penalty — variance-weighted via diag(C)
 ETA4 = 0.0              # G''''(tau) >= 0 penalty — keep OFF (causes divergence at 1.0)
 
-# ReduceLROnPlateau: uncomment and set USE_SCHEDULER = True to enable.
-USE_SCHEDULER = False
+# ReduceLROnPlateau on val loss. Val is deterministic (z = mu) so this is a
+# clean plateau signal; the scheduler drops LR once the basin tightens,
+# preventing late-training blowups driven by a constant LR of 1e-3.
+USE_SCHEDULER = True
 LR_FACTOR = 0.5         # Multiply LR by this on plateau
-LR_PATIENCE = 10        # Epochs to wait before reducing LR
+LR_PATIENCE = 6        # Epochs to wait before reducing LR
 LR_MIN = 1e-6           # Floor for LR
 
 # Spectral evaluation grid
@@ -414,6 +416,17 @@ def main():
     poles_all     = torch.cat(poles_all,     dim=0)
     residues_all  = torch.cat(residues_all,  dim=0)
 
+    # Forward pass on the dataset-averaged G(τ): a single deterministic
+    # prediction whose A(ω) summarises the dataset as one input.
+    G_avg_input = G_input_all.mean(dim=0, keepdim=True).to(DEVICE)
+    with torch.no_grad():
+        mu_a, logvar_a, _, poles_avg_in, residues_avg_in, G_recon_avg_in = model(
+            G_avg_input, deterministic=True
+        )
+    poles_from_avg    = poles_avg_in.squeeze(0).cpu()
+    residues_from_avg = residues_avg_in.squeeze(0).cpu()
+    recon_from_avg    = G_recon_avg_in.squeeze(0).cpu()
+
     torch.save({
         "inputs":       G_input_all,
         "recon":        G_recon_all,
@@ -423,6 +436,9 @@ def main():
         "recon_avg":    G_recon_all.mean(dim=0),
         "poles_avg":    poles_all.mean(dim=0),
         "residues_avg": residues_all.mean(dim=0),
+        "poles_from_avg":    poles_from_avg,
+        "residues_from_avg": residues_from_avg,
+        "recon_from_avg":    recon_from_avg,
         "beta":               BETA,
         "Ltau":               INPUT_DIM,
         "spectral_input_path": None if DATA_SOURCE == "real" else SPECTRAL_INPUT_PATH,
@@ -437,9 +453,98 @@ def main():
         "n_epochs":           n_epochs_run,
     }, f"{ft_out_dir}/summary.pt")
 
-    print(f"Summary saved to {ft_out_dir}/summary.pt")
-    print(f"Poles mean: {poles_all.mean(dim=0)}")
-    print(f"Residues mean: {residues_all.mean(dim=0)}")
+    print(f"Summary saved → {ft_out_dir}/summary.pt")
+
+    # ── End-of-run summary ────────────────────────────────────────────────────
+    smooth_f = float(np.load(f"{ft_out_dir}/losses/smooth_losses_{tag}.npy")[-1])
+    kl_f     = float(np.load(f"{ft_out_dir}/losses/kl_losses_{tag}.npy")[-1])
+    pos_f    = float(np.load(f"{ft_out_dir}/losses/pos_losses_{tag}.npy")[-1])
+    ng_f     = float(np.load(f"{ft_out_dir}/losses/neg_green_losses_{tag}.npy")[-1])
+    ng2_f    = float(np.load(f"{ft_out_dir}/losses/neg_second_losses_{tag}.npy")[-1])
+    ng4_f    = float(np.load(f"{ft_out_dir}/losses/neg_fourth_losses_{tag}.npy")[-1])
+
+    poles_np = poles_all.mean(dim=0).numpy()
+    res_np   = residues_all.mean(dim=0).numpy()
+    sim_label = (os.path.basename(QMC_SIM_DIR) if DATA_SOURCE == "real"
+                 else os.path.basename(os.path.dirname(SPECTRAL_INPUT_PATH)))
+    early_stop = n_epochs_run < FINETUNE_EPOCHS
+
+    # Switch to ASCII box-drawing: every char is exactly 1 column wide,
+    # so no font/editor can break the alignment of the table.
+    W = 78  # total inner width (between the two '|' borders)
+
+    def _border(ch_l, ch_r, fill="-"):
+        return ch_l + fill * W + ch_r
+
+    def _line(content):
+        # Truncate to W chars, then left-pad to W with spaces.
+        s = content[:W].ljust(W)
+        return f"|{s}|"
+
+    def _row(label, value="", indent=2, lw=18):
+        return _line(" " * indent + f"{label:<{lw}}{value}")
+
+    def _sec(title):
+        head = f"  -- {title} "
+        return f"+{head:-<{W}}+"
+
+    def _wrap(value, indent=4):
+        """Hard-wrap a long string across multiple table rows."""
+        room = W - indent
+        out = []
+        for i in range(0, len(value), room):
+            out.append(_line(" " * indent + value[i:i + room]))
+        return out or [_line(" " * indent)]
+
+    def _fmt_complex(v, sign="+"):
+        # 16-char tuple e.g. "+1.2345-3.6789j" (15) — pad to 16 for column alignment.
+        s = f"{v.real:{sign}.4f}{v.imag:+.4f}j"
+        return f"{s:<16}"
+
+    def _grid(values, sign="+", indent=4, sep="  "):
+        """Lay out complex values in a grid that fits inside the table."""
+        item_w   = 16 + len(sep)
+        per_row  = max(1, (W - indent) // item_w)
+        out = []
+        for i in range(0, len(values), per_row):
+            chunk = values[i:i + per_row]
+            text  = sep.join(_fmt_complex(v, sign=sign) for v in chunk).rstrip()
+            out.append(_line(" " * indent + text))
+        return out
+
+    lines = []
+    lines.append(_border("+", "+", "="))
+    lines.append(_line(f"{'RUN SUMMARY':^{W}}"))
+    lines.append(_border("+", "+", "="))
+    lines.append(_row("tag",              tag))
+    lines.append(_row("sID",              str(sID)))
+    lines.append(_row("data",             f"{DATA_SOURCE}   {sim_label}"))
+    lines.append(_row("beta/Ltau/poles",  f"{BETA} / {INPUT_DIM} / {NUM_POLES}   model = {MODEL_VERSION}"))
+    lines.append(_sec("TRAINING"))
+    lines.append(_row("epochs",     f"{n_epochs_run} / {FINETUNE_EPOCHS}" + ("  [early stop]" if early_stop else "")))
+    lines.append(_row("best epoch", f"{best_epoch+1}   val loss = {best_val_loss:.4e}"))
+    lines.append(_row("eval loss",  f"{eval_loss:.4e}"))
+    lines.append(_sec("chi^2"))
+    lines.append(_row("final",  f"{final_chi2:.6f}"))
+    lines.append(_row("best",   f"{best_chi2:.6f}   @ epoch {best_chi2_ep} / {n_epochs_run}"))
+    lines.append(_sec("LOSS COMPONENTS  (final epoch, unweighted)"))
+    lines.append(_row("chi^2",      f"{chi2_losses[-1]:.4e}",                               indent=4, lw=14))
+    lines.append(_row("smooth",     f"{smooth_f:.4e}    pos        {pos_f:.4e}",            indent=4, lw=14))
+    lines.append(_row("KL",         f"{kl_f:.4e}    neg G      {ng_f:.4e}",                 indent=4, lw=14))
+    lines.append(_row("neg G''",    f"{ng2_f:.4e}    neg G''''  {ng4_f:.4e}",               indent=4, lw=14))
+    lines.append(_sec("POLES  (dataset mean)"))
+    lines.extend(_grid(poles_np, sign="+"))
+    lines.append(_sec("RESIDUES  (dataset mean)"))
+    lines.extend(_grid(res_np, sign=""))
+    lines.append(_border("+", "+", "="))
+    lines.append(_line(f"  output"))
+    lines.extend(_wrap(ft_out_dir, indent=4))
+    lines.append(_border("+", "+", "="))
+
+    summary_path = f"{ft_out_dir}/run_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Run summary → {summary_path}")
 
     # --- Plot fine-tuning results (local only) ---
     if DO_PLOT:

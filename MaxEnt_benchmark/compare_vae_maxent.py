@@ -56,7 +56,7 @@ MB_PATH   = os.path.join(MAIN_PATH, "MaxEnt_benchmark")
 # Set to None to skip any method
 VAE_SUMMARY = os.path.join(
     MAIN_PATH, "out",
-    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles3-fresh-v2L-1",
+    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles22-fresh-v2L-1",
     "summary.pt"
 )
 
@@ -109,18 +109,32 @@ def load_vae(summary_path):
         return None
     s = torch.load(summary_path, weights_only=False)
 
+    from pretrain.pretrain_losses import spectral_from_poles  # type: ignore
+
     if "omega_eval_grid" in s and "A_mean" in s:
         omega  = s["omega_eval_grid"].numpy()
         A_mean = s["A_mean"].numpy()          # (N, Nw)
+        omega_t = torch.from_numpy(omega.astype(np.float32))
     else:
         # Derive from poles/residues deterministically (z = mu)
-        from pretrain.pretrain_losses import spectral_from_poles  # type: ignore
         poles    = s["poles"]
         residues = s["residues"]
         omega_t  = torch.linspace(-20.0, 20.0, 1000)
         with torch.no_grad():
             A_mean = spectral_from_poles(poles, residues, omega_t).numpy()
         omega = omega_t.numpy()
+
+    A_from_avg = None
+    G_recon_from_avg = None
+    if "poles_from_avg" in s and "residues_from_avg" in s:
+        with torch.no_grad():
+            A_from_avg = spectral_from_poles(
+                s["poles_from_avg"].unsqueeze(0),
+                s["residues_from_avg"].unsqueeze(0),
+                omega_t,
+            ).squeeze(0).numpy()
+        if "recon_from_avg" in s and s["recon_from_avg"] is not None:
+            G_recon_from_avg = s["recon_from_avg"].numpy()
 
     params_path = os.path.join(os.path.dirname(summary_path), "params.json")
     params = {}
@@ -132,8 +146,11 @@ def load_vae(summary_path):
         "omega":               omega,
         "A_mean":              A_mean,
         "A_avg":               A_mean.mean(0),
+        "A_from_avg":          A_from_avg,
         "G_input":             s["inputs"].numpy(),
         "G_recon":             s["recon"].numpy(),
+        "G_recon_from_avg":    G_recon_from_avg,
+        "G_input_avg":         s["inputs"].numpy().mean(0),
         "beta":                float(s["beta"]),
         "Ltau":                int(s["Ltau"]),
         "num_poles":           int(s["num_poles"]) if "num_poles" in s else None,
@@ -264,6 +281,10 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path, sim_n
     if vae is not None:
         ax1.plot(vae["omega"], vae["A_avg"], color="tab:blue", lw=1.8,
                  label=r"VAE-AC $\langle A(\omega)\rangle$")
+        if vae.get("A_from_avg") is not None:
+            ax1.plot(vae["omega"], vae["A_from_avg"],
+                     color="tab:purple", lw=1.8, ls=":",
+                     label=r"VAE-AC $A(\omega\,|\,\langle G(\tau)\rangle)$")
 
     # ana_cont MaxEnt
     if anacont is not None:
@@ -292,6 +313,10 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path, sim_n
             diff_v = vae["A_avg"] - gt_interp
             ax2.plot(vae["omega"], diff_v, color="tab:blue", lw=1.2, label="VAE")
             ax2.fill_between(vae["omega"], diff_v, alpha=0.20, color="tab:blue")
+            if vae.get("A_from_avg") is not None:
+                diff_va = vae["A_from_avg"] - gt_interp
+                ax2.plot(vae["omega"], diff_va, color="tab:purple", lw=1.2, ls=":",
+                         label=r"VAE $\langle G\rangle$")
         if anacont is not None:
             gt_interp_m = np.interp(anacont["omega"], omega_gt, A_gt)
             diff_m = anacont["A_opt"] - gt_interp_m
@@ -436,12 +461,17 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
     has_gt = A_gt is not None and omega_gt is not None
     rows = []
 
-    for label, method_data, omega_key, A_key in [
+    methods_spec = [
         ("VAE-AC (avg)",         vae,          "omega", "A_avg"),
         ("MaxEnt ana_cont",      anacont,      "omega", "A_opt"),
         ("MaxEnt OmegaMaxEnt",   omegamaxent,  "omega", "A_opt"),
-    ]:
-        if method_data is None:
+    ]
+    if vae is not None and vae.get("A_from_avg") is not None:
+        methods_spec.insert(1,
+            ("VAE-AC (from <G>)", vae,         "omega", "A_from_avg"))
+
+    for label, method_data, omega_key, A_key in methods_spec:
+        if method_data is None or method_data.get(A_key) is None:
             continue
         omega_m = method_data[omega_key]
         A_m     = method_data[A_key]
@@ -506,7 +536,7 @@ def plot_metrics_bar(rows, out_path):
     norms   = [r["norm"]   for r in rows]
     n       = len(methods)
     x       = np.arange(n)
-    colors  = ["tab:blue", "tab:orange", "tab:red"][:n]
+    colors  = ["tab:blue", "tab:purple", "tab:orange", "tab:red", "tab:gray"][:n]
 
     if has_gt:
         l2s   = [r["L2_error"]   for r in rows]
