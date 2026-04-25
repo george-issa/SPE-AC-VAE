@@ -87,9 +87,12 @@ DATA_SOURCE = "real"   # switch between synthetic CSV and real QMC JLD2
 
 # --- Model ---
 LOAD_PRETRAIN = False
-NUM_POLES = 20
+NUM_POLES = 15
 N_NODES = 256
 BATCH_SIZE = 10
+
+# Allow pretrain/run_finetune_sweep.py to override these without editing the file.
+NUM_POLES = int(os.environ.get("SWEEP_NUM_POLES", NUM_POLES))
 
 # --------------------------------------------------------------------------
 # Synthetic data (DATA_SOURCE = "synthetic")
@@ -139,8 +142,9 @@ PRETRAIN_DIR = os.path.join(
 PRETRAIN_CHECKPOINT = os.path.join(PRETRAIN_DIR, "model", "best_model_pretrain.pth")
 
 # --- Fine-tuning hyperparameters ---
-FINETUNE_EPOCHS = 400
-FINETUNE_LR = 1e-3        
+FINETUNE_EPOCHS = 200
+FINETUNE_EPOCHS = int(os.environ.get("SWEEP_FINETUNE_EPOCHS", FINETUNE_EPOCHS))
+FINETUNE_LR = 1e-3
 FINETUNE_PATIENCE = FINETUNE_EPOCHS + 1              # Early stopping enabled with a wide window
 FINETUNE_KL_ANNEAL_EPOCHS = 0
 _model_tag = {2: "v2", "2t": "v2t", "2s": "v2s"}.get(MODEL_VERSION, f"v{MODEL_VERSION}")
@@ -157,7 +161,7 @@ ETA4 = 0.0              # G''''(tau) >= 0 penalty — keep OFF (causes divergenc
 # ReduceLROnPlateau on val loss. Val is deterministic (z = mu) so this is a
 # clean plateau signal; the scheduler drops LR once the basin tightens,
 # preventing late-training blowups driven by a constant LR of 1e-3.
-USE_SCHEDULER = True
+USE_SCHEDULER = False
 LR_FACTOR = 0.5         # Multiply LR by this on plateau
 LR_PATIENCE = 6        # Epochs to wait before reducing LR
 LR_MIN = 1e-6           # Floor for LR
@@ -166,6 +170,14 @@ LR_MIN = 1e-6           # Floor for LR
 SMOOTHNESS_NW = 500
 SMOOTHNESS_WMIN = -20.0
 SMOOTHNESS_WMAX = 20.0
+
+# --- VAE diagnostics ---
+# Active-units (Burda et al. 2016): count latent dims with Var_x[mu_i(x)] > AU_THRESHOLD.
+# Cheap to compute (one extra batch-loop tensor); use as a sanity check that the
+# encoder is actually using its latent capacity. With ALPHA_KL ~ 0 you expect
+# active_units ~ latent_dim; collapse should not be an issue at that KL pressure.
+COMPUTE_ACTIVE_UNITS = True
+AU_THRESHOLD = 1e-2
 
 # Reproducibility — set to an integer (e.g. 42) for deterministic runs, or None to disable
 SEED = None
@@ -383,6 +395,7 @@ def main():
     eval_loss = 0.0
     G_input_all, G_recon_all = [], []
     poles_all, residues_all = [], []
+    mu_all, logvar_all = [], []   # only filled if COMPUTE_ACTIVE_UNITS
 
     with torch.no_grad():
         for batch in train_loader:
@@ -407,6 +420,9 @@ def main():
             G_recon_all.append(G_recon.cpu())
             poles_all.append(poles.cpu())
             residues_all.append(residues.cpu())
+            if COMPUTE_ACTIVE_UNITS:
+                mu_all.append(mu.cpu())
+                logvar_all.append(logvar.cpu())
 
     eval_loss /= len(ft_dataset)
     print(f"Final Loss: {eval_loss:.4e}")
@@ -426,6 +442,65 @@ def main():
     poles_from_avg    = poles_avg_in.squeeze(0).cpu()
     residues_from_avg = residues_avg_in.squeeze(0).cpu()
     recon_from_avg    = G_recon_avg_in.squeeze(0).cpu()
+
+    # ------------------------------------------------------------------
+    # Self-consistency metric (model-selection signal, no ground truth needed)
+    #   SC = (1/N) sum_i  int |A_i(w | G_i) - A(w | <G>)|^2 dw
+    # Lower = more consistent across samples. Reported per-run so it can be
+    # compared across e.g. NUM_POLES values without needing a MaxEnt run.
+    # ------------------------------------------------------------------
+    SC_NW   = 1000
+    SC_WMIN = -20.0
+    SC_WMAX = 20.0
+    omega_sc = torch.linspace(SC_WMIN, SC_WMAX, SC_NW)
+    with torch.no_grad():
+        A_samples_sc  = spectral_from_poles(poles_all, residues_all, omega_sc)  # (N, Nw)
+        A_from_avg_sc = spectral_from_poles(
+            poles_from_avg.unsqueeze(0),
+            residues_from_avg.unsqueeze(0),
+            omega_sc,
+        ).squeeze(0)                                                            # (Nw,)
+    diff_sc    = (A_samples_sc - A_from_avg_sc.unsqueeze(0)).numpy()           # (N, Nw)
+    diff_sq_sc = diff_sc ** 2
+    # SC-L2: integrated squared deviation, averaged over samples
+    sc_per_sample = np.trapezoid(diff_sq_sc, omega_sc.numpy(), axis=1)          # (N,)
+    sc_mean = float(sc_per_sample.mean())
+    sc_std  = float(sc_per_sample.std())
+    sc_min  = float(sc_per_sample.min())
+    sc_max  = float(sc_per_sample.max())
+    # SC-Linfty: max pointwise deviation, averaged over samples
+    sc_linf_per_sample = np.max(np.abs(diff_sc), axis=1)                        # (N,)
+    sc_linf_mean = float(sc_linf_per_sample.mean())
+    sc_linf_std  = float(sc_linf_per_sample.std())
+    sc_linf_min  = float(sc_linf_per_sample.min())
+    sc_linf_max  = float(sc_linf_per_sample.max())
+
+    # ------------------------------------------------------------------
+    # Active-units diagnostic (Burda et al. 2016): count latent dims where
+    # Var_x[mu_i(x)] > AU_THRESHOLD. Also report per-dim KL contribution.
+    # Toggleable via COMPUTE_ACTIVE_UNITS — set False to skip.
+    # ------------------------------------------------------------------
+    au_data = {}
+    if COMPUTE_ACTIVE_UNITS:
+        mu_cat     = torch.cat(mu_all,     dim=0).numpy()    # (N, D)
+        logvar_cat = torch.cat(logvar_all, dim=0).numpy()    # (N, D)
+        var_mu     = mu_cat.var(axis=0, ddof=0)              # (D,)
+        sigma2     = np.exp(logvar_cat)
+        # KL(q(z_i|x) || N(0,1)) per dim, averaged over samples
+        kl_per_dim = 0.5 * (mu_cat ** 2 + sigma2 - 1.0 - logvar_cat).mean(axis=0)  # (D,)
+        n_active   = int((var_mu > AU_THRESHOLD).sum())
+        latent_dim = int(var_mu.shape[0])
+        kl_total   = float(kl_per_dim.sum())
+        au_data = {
+            "active_units":   n_active,
+            "latent_dim":     latent_dim,
+            "au_threshold":   AU_THRESHOLD,
+            "var_mu_per_dim": var_mu,
+            "kl_per_dim":     kl_per_dim,
+            "kl_total_avg":   kl_total,
+        }
+        print(f"Active units: {n_active}/{latent_dim}  "
+              f"(threshold Var[mu]>{AU_THRESHOLD:g})  KL_total={kl_total:.4e}")
 
     torch.save({
         "inputs":       G_input_all,
@@ -451,9 +526,21 @@ def main():
         "best_chi2_epoch":    best_chi2_ep,
         "final_chi2":         final_chi2,
         "n_epochs":           n_epochs_run,
+        "self_consistency":                  sc_mean,
+        "self_consistency_std":              sc_std,
+        "self_consistency_per_sample":       sc_per_sample,
+        "self_consistency_linfty":           sc_linf_mean,
+        "self_consistency_linfty_std":       sc_linf_std,
+        "self_consistency_linfty_per_sample": sc_linf_per_sample,
+        "self_consistency_grid":             {"wmin": SC_WMIN, "wmax": SC_WMAX, "Nw": SC_NW},
+        **au_data,
     }, f"{ft_out_dir}/summary.pt")
 
     print(f"Summary saved → {ft_out_dir}/summary.pt")
+    print(f"SC-L2     = {sc_mean:.6f}  (std {sc_std:.6f}, "
+          f"min {sc_min:.6f}, max {sc_max:.6f})  over {len(sc_per_sample)} samples")
+    print(f"SC-Linfty = {sc_linf_mean:.6f}  (std {sc_linf_std:.6f}, "
+          f"min {sc_linf_min:.6f}, max {sc_linf_max:.6f})")
 
     # ── End-of-run summary ────────────────────────────────────────────────────
     smooth_f = float(np.load(f"{ft_out_dir}/losses/smooth_losses_{tag}.npy")[-1])
@@ -527,6 +614,24 @@ def main():
     lines.append(_sec("chi^2"))
     lines.append(_row("final",  f"{final_chi2:.6f}"))
     lines.append(_row("best",   f"{best_chi2:.6f}   @ epoch {best_chi2_ep} / {n_epochs_run}"))
+    lines.append(_sec(f"SELF-CONSISTENCY  (omega in [{SC_WMIN:g},{SC_WMAX:g}], Nw={SC_NW})"))
+    lines.append(_row("SC-L2 mean",      f"{sc_mean:.6f}"))
+    lines.append(_row("SC-L2 std",       f"{sc_std:.6f}"))
+    lines.append(_row("SC-L2 range",     f"[{sc_min:.6f}, {sc_max:.6f}]   N={len(sc_per_sample)}"))
+    lines.append(_row("SC-Linf mean",    f"{sc_linf_mean:.6f}"))
+    lines.append(_row("SC-Linf std",     f"{sc_linf_std:.6f}"))
+    lines.append(_row("SC-Linf range",   f"[{sc_linf_min:.6f}, {sc_linf_max:.6f}]"))
+    lines.append(_row("L2 formula",      "(1/N) sum_i  int |A_i(w|G_i) - A(w|<G>)|^2 dw"))
+    lines.append(_row("Linf formula",    "(1/N) sum_i  max_w |A_i(w|G_i) - A(w|<G>)|"))
+    if au_data:
+        lines.append(_sec(f"ACTIVE UNITS  (Var[mu]>{AU_THRESHOLD:g})"))
+        lines.append(_row("active units", f"{au_data['active_units']} / {au_data['latent_dim']}"))
+        lines.append(_row("KL total",     f"{au_data['kl_total_avg']:.4e}"))
+        top_dims = np.argsort(au_data['kl_per_dim'])[::-1][:5]
+        top_str  = "  ".join(
+            f"d{int(i)}:KL={au_data['kl_per_dim'][i]:.2e}" for i in top_dims
+        )
+        lines.append(_row("top-5 KL dims", top_str))
     lines.append(_sec("LOSS COMPONENTS  (final epoch, unweighted)"))
     lines.append(_row("chi^2",      f"{chi2_losses[-1]:.4e}",                               indent=4, lw=14))
     lines.append(_row("smooth",     f"{smooth_f:.4e}    pos        {pos_f:.4e}",            indent=4, lw=14))

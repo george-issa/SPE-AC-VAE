@@ -20,7 +20,7 @@ import argparse
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pretrain.pretrain_losses import spectral_from_poles  # type: ignore
@@ -525,20 +525,25 @@ def plot_poles_residues(poles, residues, n_samples=6, save_path=None):
 # ---------------------------------------------------------------------------
 
 def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
-                            n_samples=6, wmin=-20, wmax=20, Nw=1000, save_path=None):
-    """Plot predicted A(omega) from poles/residues for selected samples,
-    overlaid with ground truth if available.
+                            n_samples=6, wmin=-20, wmax=20, Nw=1000, save_path=None,
+                            poles_from_avg=None, residues_from_avg=None):
+    """Plot predicted A(omega) from poles/residues for selected samples.
+
+    Each sample slot has two stacked panels:
+      - Top: per-sample A_i(omega), overlaid with ground truth (if any) and
+             the reference A(omega | <G(tau)>) computed from poles_from_avg /
+             residues_from_avg (if provided).
+      - Bottom: difference panel A_i(omega) - A(omega | <G>), annotated with
+             the per-sample SC-L2 = int(diff^2) dw and SC-Linfty = max|diff|.
 
     Parameters
     ----------
-    poles       : complex tensor (N, P)
-    residues    : complex tensor (N, P)
-    A_input     : ndarray (N_omega,) or None, ground truth spectral function
-    omega_input : ndarray (N_omega,) or None, omega grid for ground truth
-    n_samples   : int
-    wmin, wmax  : float, omega range
-    Nw          : int, number of omega grid points
-    save_path   : str or None
+    poles, residues          : complex tensor (N, P), per-sample VAE outputs
+    A_input, omega_input     : ground-truth spectrum + grid (optional)
+    poles_from_avg,
+    residues_from_avg        : complex tensor (P,) — VAE output from <G>;
+                               drives the overlay and the per-sample SC values
+    n_samples, wmin, wmax, Nw, save_path : usual
     """
     if not isinstance(poles, torch.Tensor):
         poles = torch.tensor(poles)
@@ -555,45 +560,96 @@ def plot_spectral_predicted(poles, residues, A_input=None, omega_input=None,
     A_pred = A_pred.numpy()
     omegas_np = omegas.numpy()
 
+    A_ref = None
+    if poles_from_avg is not None and residues_from_avg is not None:
+        if not isinstance(poles_from_avg, torch.Tensor):
+            poles_from_avg = torch.tensor(poles_from_avg)
+        if not isinstance(residues_from_avg, torch.Tensor):
+            residues_from_avg = torch.tensor(residues_from_avg)
+        with torch.no_grad():
+            A_ref = spectral_from_poles(
+                poles_from_avg.unsqueeze(0),
+                residues_from_avg.unsqueeze(0),
+                omegas,
+            ).squeeze(0).numpy()
+
     cols = min(3, n_samples)
     rows = (n_samples + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+
+    fig = plt.figure(figsize=(5 * cols, 5 * rows))
+    outer = GridSpec(rows, cols, figure=fig, hspace=0.45, wspace=0.32)
 
     for i in range(n_samples):
-        ax = axes[i // cols, i % cols]
+        r, c = i // cols, i % cols
+        if A_ref is not None:
+            inner = GridSpecFromSubplotSpec(
+                2, 1, subplot_spec=outer[r, c],
+                height_ratios=[3, 1], hspace=0.08,
+            )
+            ax_main = fig.add_subplot(inner[0])
+            ax_diff = fig.add_subplot(inner[1], sharex=ax_main)
+        else:
+            ax_main = fig.add_subplot(outer[r, c])
+            ax_diff = None
 
         # Ground truth
         if A_input is not None and omega_input is not None:
-            ax.fill_between(omega_input, A_input, alpha=0.15, color=COLORS["target"])
-            ax.plot(omega_input, A_input, "-", color=COLORS["target"], linewidth=1.5,
-                    label="Input (exact)")
+            ax_main.fill_between(omega_input, A_input, alpha=0.15, color=COLORS["target"])
+            ax_main.plot(omega_input, A_input, "-", color=COLORS["target"], linewidth=1.5,
+                         label="Input (exact)")
 
-        ax.plot(omegas_np, A_pred[i], "-", color=COLORS["pred"], linewidth=1.5,
-                label=r"Predicted ($z = \mu$)")
+        # Per-sample prediction
+        ax_main.plot(omegas_np, A_pred[i], "-", color=COLORS["pred"], linewidth=1.5,
+                     label=r"Predicted ($z = \mu$)")
 
-        # Mark pole positions
+        # Reference: A from <G> (also the SC reference)
+        if A_ref is not None:
+            ax_main.plot(omegas_np, A_ref, "--", color="#8E24AA", linewidth=1.5,
+                         alpha=0.9, label=r"$A(\omega\,|\,\langle G(\tau)\rangle)$")
+
+        # Pole positions
         eps = poles[i].real.numpy()
         for p in range(len(eps)):
-            ax.axvline(eps[p], color=COLORS["pole_re"], linestyle="--",
-                       alpha=0.4, linewidth=0.8)
+            ax_main.axvline(eps[p], color=COLORS["pole_re"], linestyle="--",
+                            alpha=0.4, linewidth=0.8)
 
-        ax.set_title(f"Sample {i+1}")
-        ax.set_xlabel(r"$\omega$")
-        ax.set_ylabel(r"$A(\omega)$")
-        ax.set_xlim(wmin, wmax)
-        ax.legend(loc="upper right")
+        ax_main.set_title(f"Sample {i+1}")
+        ax_main.set_ylabel(r"$A(\omega)$")
+        ax_main.set_xlim(wmin, wmax)
+        ax_main.legend(loc="upper right", fontsize=8)
+        if ax_diff is not None:
+            plt.setp(ax_main.get_xticklabels(), visible=False)
+        else:
+            ax_main.set_xlabel(r"$\omega$")
 
-    for i in range(n_samples, rows * cols):
-        axes[i // cols, i % cols].set_visible(False)
+        # Difference panel + per-sample SC annotation
+        if ax_diff is not None:
+            diff = A_pred[i] - A_ref
+            sc_l2_i   = float(np.trapezoid(diff ** 2, omegas_np))
+            sc_linf_i = float(np.max(np.abs(diff)))
+            ax_diff.axhline(0, color="gray", lw=0.6, alpha=0.5)
+            ax_diff.plot(omegas_np, diff, "-", color=COLORS["pred"], linewidth=1.0)
+            ax_diff.fill_between(omegas_np, diff, alpha=0.20, color=COLORS["pred"])
+            ax_diff.text(
+                0.02, 0.92,
+                rf"SC-$L^2$ = {sc_l2_i:.4f}     SC-$L^\infty$ = {sc_linf_i:.4f}",
+                transform=ax_diff.transAxes, fontsize=8.5, va="top",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.7", alpha=0.9),
+            )
+            ax_diff.set_xlabel(r"$\omega$")
+            ax_diff.set_ylabel(r"$\Delta A$", fontsize=10)
+            ax_diff.set_xlim(wmin, wmax)
+            ax_diff.grid(True, alpha=0.3)
 
     fig.suptitle(
         r"Predicted $A(\omega) = -\frac{1}{\pi}\sum_p \mathrm{Im}"
         r"\!\left(\frac{r_p}{\omega - s_p}\right)$"
         "\n"
-        r"Deterministic $z = \mu$; dashed verticals: pole positions $\epsilon_p$",
-        fontsize=13, y=1.04,
+        r"Deterministic $z = \mu$; dashed verticals: pole positions $\epsilon_p$"
+        + (r"; difference panel: $A_i(\omega) - A(\omega|\langle G\rangle)$"
+           if A_ref is not None else ""),
+        fontsize=13, y=1.02,
     )
-    plt.tight_layout()
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
         print(f"Saved: {save_path}")
@@ -674,10 +730,15 @@ def plot_spectral_average(poles, residues, A_input=None, omega_input=None,
         ax1.plot(omegas_np, A_from_avg, ":", color="#8E24AA", linewidth=2,
                  label=r"$A(\omega \mid \langle G(\tau)\rangle)$ (single forward pass)")
 
+    # Average pole positions — one entry per pole bloats the legend at high
+    # NUM_POLES, so the per-pole verticals are unlabeled and a single proxy
+    # entry covers them all in red.
     for p in range(len(eps_mean)):
-        ax1.axvline(eps_mean[p], color=COLORS["pole_re"], linestyle="--",
-                    alpha=0.5, linewidth=1.0,
-                    label=rf"$\langle \epsilon_{p+1} \rangle = {eps_mean[p]:.2f}$")
+        ax1.axvline(eps_mean[p], color="tab:green", linestyle="--",
+                    alpha=0.5, linewidth=1.0)
+    if len(eps_mean) > 0:
+        ax1.axvline(eps_mean[0], color="tab:green", linestyle="--",
+                    alpha=0.5, linewidth=1.0, label=r"pole positions")
 
     ax1.set_ylabel(r"$A(\omega)$")
     ax1.set_title(r"Dataset-averaged $A(\omega)$: $\langle\cdot\rangle$ and $\pm 1\sigma$ over all samples")
@@ -936,10 +997,13 @@ def plot_finetune_eval(summary_file, output_dir=None):
     plot_poles_residues(poles, residues, n_samples=min(20, len(poles)),
                         save_path=os.path.join(output_dir, "poles_residues.pdf"))
 
-    # Predicted A(omega) for individual samples (with ground truth overlay)
+    # Predicted A(omega) for individual samples (with ground truth overlay
+    # and the SC-reference A(omega|<G>) overlay + per-sample diff panel)
     plot_spectral_predicted(poles, residues,
                             A_input=A_input, omega_input=omega_input,
                             n_samples=6,
+                            poles_from_avg=d.get("poles_from_avg"),
+                            residues_from_avg=d.get("residues_from_avg"),
                             save_path=os.path.join(output_dir, "spectral_predicted.pdf"))
 
     # Average A(omega) with ground truth overlay and difference

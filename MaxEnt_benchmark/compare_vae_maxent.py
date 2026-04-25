@@ -56,9 +56,12 @@ MB_PATH   = os.path.join(MAIN_PATH, "MaxEnt_benchmark")
 # Set to None to skip any method
 VAE_SUMMARY = os.path.join(
     MAIN_PATH, "out",
-    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles22-fresh-v2L-1",
+    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles10-fresh-v2L-1",
     "summary.pt"
 )
+# Allow a sweep wrapper to override without editing this file.
+if os.environ.get("SWEEP_VAE_SUMMARY"):
+    VAE_SUMMARY = os.environ["SWEEP_VAE_SUMMARY"]
 
 # ana_cont MaxEnt summary (produced by run_anacont_maxent.py, MODE='mean')
 ANACONT_SUMMARY = os.path.join(
@@ -156,6 +159,8 @@ def load_vae(summary_path):
         "num_poles":           int(s["num_poles"]) if "num_poles" in s else None,
         "spectral_input_path": str(s.get("spectral_input_path", "")),
         "params":              params,
+        "self_consistency":    (float(s["self_consistency"])
+                                if "self_consistency" in s else None),
     }
 
 
@@ -212,6 +217,23 @@ def compute_chi2(G_recon, G_input, C_inv):
     # chi2 = diff^T C^{-1} diff / L
     tmp = diff @ C_inv                # (..., L)
     return float(np.mean(np.sum(tmp * diff, axis=-1)))
+
+
+def selfconsistency_metric(omega, A_samples, A_ref):
+    """Self-consistency spread of per-sample predictions around a reference.
+
+        SC = (1/N) sum_i  integral  |A_i(omega) - A_ref(omega)|^2  d omega
+
+    A_samples : (N, Nw) per-sample VAE spectra A_i(omega | G_i(tau))
+    A_ref     : (Nw,)   reference spectrum, typically A(omega | <G(tau)>)
+                        — the prediction from the dataset-averaged G(tau).
+
+    Lower is better. Intended as a model-selection signal (e.g. choosing
+    the number of poles) when ground-truth A(omega) is unavailable.
+    """
+    diff_sq = (A_samples - A_ref[None, :]) ** 2          # (N, Nw)
+    per_sample = np.trapezoid(diff_sq, omega, axis=1)    # (N,)
+    return float(per_sample.mean())
 
 
 # ============================================================================
@@ -461,6 +483,17 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
     has_gt = A_gt is not None and omega_gt is not None
     rows = []
 
+    sc_val = None
+    if vae is not None:
+        # Prefer precomputed value from summary.pt (run_finetune.py writes this).
+        sc_val = vae.get("self_consistency")
+        if (sc_val is None
+                and vae.get("A_mean") is not None
+                and vae.get("A_from_avg") is not None):
+            sc_val = selfconsistency_metric(
+                vae["omega"], vae["A_mean"], vae["A_from_avg"]
+            )
+
     methods_spec = [
         ("VAE-AC (avg)",         vae,          "omega", "A_avg"),
         ("MaxEnt ana_cont",      anacont,      "omega", "A_opt"),
@@ -482,6 +515,10 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
             "method": label,
             "norm":   round(norm, 4),
             "chi2":   round(chi2_val, 5) if not np.isnan(chi2_val) else None,
+            "self_consistency": (
+                round(sc_val, 6) if (label == "VAE-AC (avg)" and sc_val is not None)
+                else None
+            ),
         }
         if has_gt:
             gt_interp = np.interp(omega_m, omega_gt, A_gt)
@@ -491,18 +528,24 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
 
     # Print table
     if has_gt:
-        header = f"\n{'Method':<30} {'Norm':>8} {'L2 err':>10} {'Linf err':>10} {'chi2':>8}"
+        header = (f"\n{'Method':<30} {'Norm':>8} {'L2 err':>10} "
+                  f"{'Linf err':>10} {'chi2':>8} {'SC':>10}")
     else:
-        header = f"\n{'Method':<30} {'Norm':>8} {'chi2':>8}"
+        header = f"\n{'Method':<30} {'Norm':>8} {'chi2':>8} {'SC':>10}"
     print(header)
     print("=" * len(header.lstrip("\n")))
     for r in rows:
         chi2_str = f"{r['chi2']:.5f}" if r["chi2"] is not None else "   n/a"
+        sc_str   = (f"{r['self_consistency']:.6f}"
+                    if r["self_consistency"] is not None else "     n/a")
         if has_gt:
             print(f"{r['method']:<30} {r['norm']:>8.4f} {r['L2_error']:>10.5f} "
-                  f"{r['Linf_error']:>10.5f} {chi2_str:>8}")
+                  f"{r['Linf_error']:>10.5f} {chi2_str:>8} {sc_str:>10}")
         else:
-            print(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8}")
+            print(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8} {sc_str:>10}")
+    if sc_val is not None:
+        print(f"\n  SC = (1/N) sum_i  int |A_i(w) - A(w|<G>)|^2 dw   "
+              f"[lower = more self-consistent]")
     print()
 
     # Save
@@ -512,11 +555,16 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
         f.write("=" * len(header.lstrip("\n")) + "\n")
         for r in rows:
             chi2_str = f"{r['chi2']:.5f}" if r["chi2"] is not None else "   n/a"
+            sc_str   = (f"{r['self_consistency']:.6f}"
+                        if r["self_consistency"] is not None else "     n/a")
             if has_gt:
                 f.write(f"{r['method']:<30} {r['norm']:>8.4f} {r['L2_error']:>10.5f} "
-                        f"{r['Linf_error']:>10.5f} {chi2_str:>8}\n")
+                        f"{r['Linf_error']:>10.5f} {chi2_str:>8} {sc_str:>10}\n")
             else:
-                f.write(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8}\n")
+                f.write(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8} {sc_str:>10}\n")
+        if sc_val is not None:
+            f.write("\nSC = (1/N) sum_i  int |A_i(w) - A(w|<G>)|^2 dw   "
+                    "[lower = more self-consistent]\n")
     json_path = os.path.join(out_dir, "metrics.json")
     with open(json_path, "w") as f:
         json.dump(rows, f, indent=2)
