@@ -95,6 +95,19 @@ N_SAMPLES = 50      # max samples in per_sample mode (None = all)
 # False — use diagonal SEM errors only; stabler and the standard MaxEnt approach.
 USE_FULL_COV = True
 
+# --- PH-symmetric data preprocessing (mean mode only) ---
+# When True, symmetrize G_mean and the covariance via M = (1/2)(I + R) where R
+# swaps tau_i with tau_{L_tau - i} (i.e. tau <-> beta - tau), then run standard
+# 'time_fermionic' MaxEnt. This is upstream's recommended approach for enforcing
+# A(omega) = A(-omega) in PH-symmetric systems (their `time_fermionic_phsym`
+# kernel "does not give good results in this implementation" per
+# kernels.py:110). Output filename gets a `_phsym` suffix.
+# tau_0 = 0 has no in-grid partner (would be tau_L_tau = beta); it is left
+# unchanged. Override at runtime via env var SWEEP_PH_SYMMETRIZE.
+PH_SYMMETRIZE = False
+if os.environ.get("SWEEP_PH_SYMMETRIZE"):
+    PH_SYMMETRIZE = os.environ["SWEEP_PH_SYMMETRIZE"].strip().lower() in ("1", "true", "yes")
+
 # --- Output (set automatically from data source) ---
 if DATA_SOURCE == "real":
     _out_tag = f"anacont_real-{os.path.basename(QMC_SIM_DIR)}"
@@ -120,6 +133,36 @@ def compute_covariance(G_bins):
     G_mean = G_bins.mean(axis=0, keepdims=True)
     dG = G_bins - G_mean
     return (dG.T @ dG) / (N - 1)
+
+
+def symmetrize_op(L_tau):
+    """Build the PH symmetrization matrix M for a tau grid of size L_tau.
+
+    Maps a vector v of length L_tau to v_sym such that
+      v_sym[i] = 0.5 * (v[i] + v[L_tau - i])    for i in [1, L_tau-1]
+      v_sym[0] = v[0]                            (no in-grid partner for tau=0)
+    The mid-point i = L_tau/2 is its own partner; M[L_tau/2, L_tau/2] = 1.
+    """
+    M = np.zeros((L_tau, L_tau))
+    M[0, 0] = 1.0
+    for i in range(1, L_tau):
+        M[i, i] += 0.5
+        M[i, L_tau - i] += 0.5
+    return M
+
+
+def symmetrize_gtau(G_mean, cov):
+    """Apply PH symmetrization to G_mean and its covariance:
+      G_sym = M G,    Cov_sym = M Cov M^T
+    """
+    L_tau = len(G_mean)
+    M = symmetrize_op(L_tau)
+    G_sym = M @ G_mean
+    cov_sym = M @ cov @ M.T
+    asym_resid = float(np.max(np.abs(G_mean - G_sym)) / max(np.max(np.abs(G_mean)), 1e-30))
+    print(f"  PH symmetrization: max|G - G_sym|/max|G| = {asym_resid:.4e} "
+          f"(pre-symmetrization asymmetry of the input)")
+    return G_sym, cov_sym
 
 
 def regularize_cov(C, rcond=1e-6):
@@ -272,6 +315,7 @@ def main():
         "BLUR_WIDTH":           BLUR_WIDTH,
         "MODE":                 MODE,
         "N_SAMPLES":            N_SAMPLES,
+        "PH_SYMMETRIZE":        PH_SYMMETRIZE,
     }
     with open(os.path.join(OUT_DIR, "params.json"), "w") as f:
         json.dump(params, f, indent=2)
@@ -283,6 +327,11 @@ def main():
         print("\n--- Mode: MEAN ---")
         G_mean    = G_bins.mean(axis=0)
         cov_mean  = C / N_bins              # covariance of the mean: C_ij / N
+
+        if PH_SYMMETRIZE:
+            print("\n--- PH symmetrization: G_sym = (1/2)(G(tau) + G(beta-tau)) ---")
+            G_mean, cov_mean = symmetrize_gtau(G_mean, cov_mean)
+
         cov_mean  = regularize_cov(cov_mean)  # floor near-zero eigenvalues
 
         print(f"G_mean(tau=0) = {G_mean[0]:.6f}")
@@ -299,8 +348,9 @@ def main():
         norm = np.trapezoid(A_opt, omega)
         print(f"  chi2 = {chi2:.4f},  ∫A dω = {norm:.4f}")
 
+        out_name = "summary_mean_fullcov_phsym.npz" if PH_SYMMETRIZE else "summary_mean_fullcov.npz"
         np.savez(
-            os.path.join(OUT_DIR, "summary_mean_fullcov.npz"),
+            os.path.join(OUT_DIR, out_name),
             omega=omega,
             A_opt=A_opt,
             chi2=chi2,
@@ -311,8 +361,9 @@ def main():
             sem_err=sem_diag,
             cov_mean=cov_mean,
             spectral_input_path=spectral_input_path if spectral_input_path else "",
+            ph_symmetrized=PH_SYMMETRIZE,
         )
-        print(f"  Saved: {OUT_DIR}/summary_mean_fullcov.npz")
+        print(f"  Saved: {OUT_DIR}/{out_name}")
 
     # ------------------------------------------------------------------
     # Mode: PER_SAMPLE — MaxEnt on each individual G(tau) bin
