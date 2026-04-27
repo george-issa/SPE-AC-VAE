@@ -56,7 +56,7 @@ MB_PATH   = os.path.join(MAIN_PATH, "MaxEnt_benchmark")
 # Set to None to skip any method
 VAE_SUMMARY = os.path.join(
     MAIN_PATH, "out",
-    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles10-fresh-v2L-1",
+    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles4_ph_z2-fresh-v2L-1",
     "summary.pt"
 )
 # Allow a sweep wrapper to override without editing this file.

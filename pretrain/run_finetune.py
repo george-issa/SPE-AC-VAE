@@ -87,12 +87,28 @@ DATA_SOURCE = "real"   # switch between synthetic CSV and real QMC JLD2
 
 # --- Model ---
 LOAD_PRETRAIN = False
-NUM_POLES = 15
+NUM_POLES = 10
 N_NODES = 256
 BATCH_SIZE = 10
 
+# Latent bottleneck dim. None -> default (= 4*NUM_POLES - 2, legacy behaviour).
+# Set to an int to force a smaller latent (decoupled from num_poles); useful for
+# studying intrinsic-capacity / reproducibility experiments.
+LATENT_DIM = 2
+
+# Particle-hole symmetry on the decoder. When True, NUM_POLES denotes the
+# *free* pole count; the model concatenates each free pole with its PH partner
+# (-eps, gamma, a, -b), so the spectral function is even (A(w)=A(-w)) and the
+# effective pole count is 2*NUM_POLES. The free count is what the network has
+# to predict; downstream wall-clock and parameter count track NUM_POLES.
+PH_SYMMETRIC = False
+
 # Allow pretrain/run_finetune_sweep.py to override these without editing the file.
 NUM_POLES = int(os.environ.get("SWEEP_NUM_POLES", NUM_POLES))
+if os.environ.get("SWEEP_LATENT_DIM"):
+    LATENT_DIM = int(os.environ["SWEEP_LATENT_DIM"])
+if os.environ.get("SWEEP_PH_SYMMETRIC"):
+    PH_SYMMETRIC = os.environ["SWEEP_PH_SYMMETRIC"].strip().lower() in ("1", "true", "yes")
 
 # --------------------------------------------------------------------------
 # Synthetic data (DATA_SOURCE = "synthetic")
@@ -215,6 +231,8 @@ def main():
         num_poles=NUM_POLES,
         beta=BETA,
         N_nodes=N_NODES,
+        latent_dim=LATENT_DIM,
+        ph_symmetric=PH_SYMMETRIC,
     ).to(DEVICE)
 
     if LOAD_PRETRAIN and os.path.exists(PRETRAIN_CHECKPOINT):
@@ -241,7 +259,12 @@ def main():
         else f"synthetic-{SPECTRAL_TYPE}_s{NOISE_S:.0e}_xi{NOISE_XI}"
     )
     _init_tag  = "pretrained" if LOAD_PRETRAIN else "fresh"
-    _base_name = f"finetune_{_out_label}_numpoles{NUM_POLES}-{_init_tag}-{_model_tag}"
+    # Latent-bottleneck override gets a `_z{N}` suffix so runs are kept distinct
+    # from default-latent_dim runs at the same num_poles. PH-symmetric runs get
+    # a `_ph` suffix for the same reason — same NUM_POLES, different decoder.
+    _z_tag     = f"_z{LATENT_DIM}" if LATENT_DIM is not None else ""
+    _ph_tag    = "_ph" if PH_SYMMETRIC else ""
+    _base_name = f"finetune_{_out_label}_numpoles{NUM_POLES}{_ph_tag}{_z_tag}-{_init_tag}-{_model_tag}"
     _out_root  = os.path.join(MAIN_PATH, "out")
     os.makedirs(_out_root, exist_ok=True)
     _used_ids  = [
@@ -253,7 +276,8 @@ def main():
     ]
     _next_id   = max(_used_ids, default=0) + 1
     sID        = f"{_init_tag}-{_model_tag}-{_next_id}"
-    ft_out_dir = os.path.join(_out_root, f"finetune_{_out_label}_numpoles{NUM_POLES}-{sID}")
+    ft_out_dir = os.path.join(_out_root,
+                              f"finetune_{_out_label}_numpoles{NUM_POLES}{_ph_tag}{_z_tag}-{sID}")
     print(f"Output directory: {ft_out_dir}")
     MakeOutPath(ft_out_dir)
 
@@ -285,6 +309,9 @@ def main():
         "NUM_POLES": NUM_POLES,
         "INPUT_DIM": INPUT_DIM,
         "N_NODES": N_NODES,
+        "LATENT_DIM": LATENT_DIM,
+        "PH_SYMMETRIC": PH_SYMMETRIC,
+        "NUM_POLES_EFFECTIVE": 2 * NUM_POLES if PH_SYMMETRIC else NUM_POLES,
         "BETA": BETA,
         "DTAU": DTAU,
         "BATCH_SIZE": BATCH_SIZE,

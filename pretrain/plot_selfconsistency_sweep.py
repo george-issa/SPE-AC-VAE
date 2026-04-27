@@ -40,10 +40,10 @@ EPOCHS_FILTER = 200
 
 # Show the active-units panel. False -> 1x3 layout (SC-L² | SC-L^∞ | chi²).
 # True  -> 2x2 layout (adds AU panel bottom-right).
-SHOW_AU = False
+SHOW_AU = True
 
 # Substring filter on folder name (str) or None for no filter.
-NAME_FILTER = None
+NAME_FILTER = "z2"
 
 # Default I/O. None for OUT_ROOT means "<project_root>/out".
 # OUT_DIR=None means "write plot+csv into OUT_ROOT".
