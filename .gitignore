@@ -41,3 +41,6 @@ how_to_run_new_benchmark.md
 OmegaMaxEnt*
 *.dat
 supervisor*
+obsidian/
+obsidian
+.obsidian/
