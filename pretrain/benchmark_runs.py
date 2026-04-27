@@ -216,6 +216,18 @@ def make_plots(blocks, out_dir: str):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    plt.rcParams.update({
+        "font.size": 12,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "legend.fontsize": 10,
+        "figure.dpi": 120,
+        "font.family": "serif",
+        "text.usetex": True,
+        "text.latex.preamble": r"\usepackage{amsmath} \usepackage{amssymb}",
+    })
+
     os.makedirs(out_dir, exist_ok=True)
 
     # 1. Spectral overlay
@@ -228,7 +240,7 @@ def make_plots(blocks, out_dir: str):
     ax.legend(frameon=False)
     fig.tight_layout()
     p = os.path.join(out_dir, "spectral_avg_compare.pdf")
-    fig.savefig(p); plt.close(fig); print(f"Saved: {p}")
+    fig.savefig(p, dpi=150, bbox_inches="tight"); plt.close(fig); print(f"Saved: {p}")
 
     # 2. Asymmetry residual A(w) - A(-w). Flat zero for PH; finite wobble for unconstrained.
     fig, ax = plt.subplots(figsize=(7, 4))
@@ -240,7 +252,7 @@ def make_plots(blocks, out_dir: str):
     ax.legend(frameon=False)
     fig.tight_layout()
     p = os.path.join(out_dir, "asymmetry_compare.pdf")
-    fig.savefig(p); plt.close(fig); print(f"Saved: {p}")
+    fig.savefig(p, dpi=150, bbox_inches="tight"); plt.close(fig); print(f"Saved: {p}")
 
     # 3. Loss curves chi^2 vs epoch
     fig, ax = plt.subplots(figsize=(7, 4))
@@ -254,7 +266,7 @@ def make_plots(blocks, out_dir: str):
     ax.legend(frameon=False)
     fig.tight_layout()
     p = os.path.join(out_dir, "loss_curves_compare.pdf")
-    fig.savefig(p); plt.close(fig); print(f"Saved: {p}")
+    fig.savefig(p, dpi=150, bbox_inches="tight"); plt.close(fig); print(f"Saved: {p}")
 
     # 4. Tail coefficients (only c_1, c_3 are physically informative; c_0/c_2/c_4 are 0 by PH)
     fig, axes = plt.subplots(1, 2, figsize=(8.5, 3.6))
@@ -268,10 +280,10 @@ def make_plots(blocks, out_dir: str):
         ax.axhline(0, color="gray", alpha=0.5, lw=0.7)
         ax.set_xticks(x); ax.set_xticklabels(labels, rotation=20, ha="right")
         ax.set_ylabel(ylabel)
-    fig.suptitle("Tail-expansion coefficients (per-sample mean ± std)")
+    fig.suptitle(r"Tail-expansion coefficients (per-sample mean $\pm$ std)")
     fig.tight_layout()
     p = os.path.join(out_dir, "tail_coeffs_compare.pdf")
-    fig.savefig(p); plt.close(fig); print(f"Saved: {p}")
+    fig.savefig(p, dpi=150, bbox_inches="tight"); plt.close(fig); print(f"Saved: {p}")
 
 
 # --------------------------------------------------------------------------- #
