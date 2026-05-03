@@ -56,7 +56,7 @@ MB_PATH   = os.path.join(MAIN_PATH, "MaxEnt_benchmark")
 # Set to None to skip any method
 VAE_SUMMARY = os.path.join(
     MAIN_PATH, "out",
-    "finetune_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1_numpoles4_ph_z2-fresh-v2L-1",
+    "finetune_real-site_holstein_b10.00_w1.00_n1.00_numpoles10_z2_covlw-fresh-v2L-1",
     "summary.pt"
 )
 # Allow a sweep wrapper to override without editing this file.
@@ -66,9 +66,11 @@ if os.environ.get("SWEEP_VAE_SUMMARY"):
 # ana_cont MaxEnt summary (produced by run_anacont_maxent.py, MODE='mean')
 ANACONT_SUMMARY = os.path.join(
     MB_PATH, "out",
-    "anacont_real-hubbard_square_U8.00_mu0.00_L4_b6.00-1",
+    "anacont_real-site_holstein_b10.00_w1.00_n1.00",
     "summary_mean_fullcov.npz"
 )
+if os.environ.get("SWEEP_ANACONT_SUMMARY"):
+    ANACONT_SUMMARY = os.environ["SWEEP_ANACONT_SUMMARY"]
 
 # OmegaMaxEnt summary (produced by run_omegamaxent.py) — set to None to skip
 OMEGAMAXENT_SUMMARY = None
@@ -158,6 +160,8 @@ def load_vae(summary_path):
         "Ltau":                int(s["Ltau"]),
         "num_poles":           int(s["num_poles"]) if "num_poles" in s else None,
         "spectral_input_path": str(s.get("spectral_input_path", "")),
+        "dos_ref":             (s["dos_ref"].numpy() if "dos_ref" in s else None),
+        "ws_ref":              (s["ws_ref"].numpy()  if "ws_ref"  in s else None),
         "params":              params,
         "self_consistency":    (float(s["self_consistency"])
                                 if "self_consistency" in s else None),
@@ -178,6 +182,8 @@ def load_anacont(npz_path):
         "tau":                 d["tau"],
         "beta":                float(d["beta"]),
         "spectral_input_path": str(d["spectral_input_path"]),
+        "dos_ref":             (np.asarray(d["dos_ref"]) if "dos_ref" in d.files else None),
+        "ws_ref":              (np.asarray(d["ws_ref"])  if "ws_ref"  in d.files else None),
     }
 
 
@@ -240,6 +246,26 @@ def selfconsistency_metric(omega, A_samples, A_ref):
 # PLOTS
 # ============================================================================
 
+# Modern, colorblind-safe palette (Okabe-Ito-derived) used across all
+# spectral / G(tau) / metrics figures so a curve has the same identity
+# everywhere it appears. Keep these as constants; do not introduce ad-hoc
+# colors elsewhere in this file.
+COLOR_VAE           = "#0072B2"   # Okabe-Ito blue — VAE
+COLOR_MAXENT        = "#2C2C2C"   # near-black slate — MaxEnt ana_cont (comparison basis)
+COLOR_DEAC          = "#D55E00"   # Okabe-Ito vermilion — DEAC / external reference (a comparator, not the basis)
+COLOR_OMEGAMAXENT   = "#CC79A7"   # Okabe-Ito reddish purple — OmegaMaxEnt
+COLOR_GREEN_INPUT   = "#2C2C2C"   # G(tau) input curve (G(tau) plot — separate role)
+COLOR_VAE_RECON     = "#0072B2"   # VAE-reconstructed G(tau)
+COLOR_ANACONT_BACK  = "#D55E00"   # ana_cont back-transform of G(tau)
+
+# Subtle styling shared across plots — light grid + soft spine color, all
+# four sides of the frame kept visible (square frame).
+def _despine(ax, *, grid=True):
+    for side in ("top", "right", "left", "bottom"):
+        ax.spines[side].set_color("#666666")
+    if grid:
+        ax.grid(True, alpha=0.25, lw=0.6, ls=":", color="#999999")
+
 def _make_model_title(sim_name):
     """Parse a simulation folder name into a formatted LaTeX title string."""
     import re as _re
@@ -253,12 +279,22 @@ def _make_model_title(sim_name):
         r"w(?P<w>[\d.]+)_a(?P<a>[\d.]+)_b(?P<b>[\d.]+)_L(?P<L>\d+)",
         sim_name,
     )
+    _m_site_holstein = _re.search(
+        r"site_holstein_b(?P<b>[\d.]+)_w(?P<w>[\d.]+)_n(?P<n>[\d.]+)",
+        sim_name,
+    )
     if _m_hubbard:
         return (
             rf"Hubbard: $U={_m_hubbard.group('U')}$, "
             rf"$\mu={_m_hubbard.group('mu')}$, "
             rf"$\beta={_m_hubbard.group('b')}$, "
             rf"$L={_m_hubbard.group('L')}$"
+        )
+    elif _m_site_holstein:
+        return (
+            rf"Site-Holstein: $\Omega={_m_site_holstein.group('w')}$, "
+            rf"$\beta={_m_site_holstein.group('b')}$, "
+            rf"$n={_m_site_holstein.group('n')}$"
         )
     elif _m_holstein:
         return (
@@ -270,10 +306,14 @@ def _make_model_title(sim_name):
     return sim_name.replace("_", r"\_")
 
 
-def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path, sim_name=None):
-    """Dataset-averaged A(omega): VAE + MaxEnt methods + ground truth.
+def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path,
+                      sim_name=None, gt_label="Ground truth"):
+    """Dataset-averaged A(omega): VAE + MaxEnt methods + reference curve.
 
-    Difference panel (ΔA) is only shown when ground truth is available.
+    `gt_label` controls the legend/residual-panel name for the green reference
+    curve (e.g. "DEAC reference" for site-Holstein cube cells, "Ground truth"
+    for synthetic targets). Difference panel (ΔA) is only shown when a
+    reference is available.
     """
     has_gt = A_gt is not None
 
@@ -293,68 +333,90 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path, sim_n
             model_title += rf"~~$|$~~{num_poles} poles (VAE)"
         fig.suptitle(model_title, fontsize=13, y=1.01)
 
-    # Ground truth
-    if has_gt:
-        ax1.fill_between(omega_gt, A_gt, alpha=0.12, color="tab:green")
-        ax1.plot(omega_gt, A_gt, color="tab:green", lw=1.8, alpha=0.9,
-                 label=r"Ground truth")
-
-    # VAE
-    if vae is not None:
-        ax1.plot(vae["omega"], vae["A_avg"], color="tab:blue", lw=1.8,
-                 label=r"VAE-AC $\langle A(\omega)\rangle$")
-        if vae.get("A_from_avg") is not None:
-            ax1.plot(vae["omega"], vae["A_from_avg"],
-                     color="tab:purple", lw=1.8, ls=":",
-                     label=r"VAE-AC $A(\omega\,|\,\langle G(\tau)\rangle)$")
-
-    # ana_cont MaxEnt
+    # MaxEnt (ana_cont) is the comparison basis — dashed, dark slate, lw=1.4.
+    # Plot first so it sits underneath the comparator curves.
     if anacont is not None:
         ax1.plot(anacont["omega"], anacont["A_opt"],
-                 color="tab:orange", lw=1.8, ls="--",
+                 color=COLOR_MAXENT, lw=1.4, ls="--", alpha=0.95,
                  label=r"MaxEnt (ana\_cont)")
 
-    # OmegaMaxEnt
+    # DEAC / external reference — a comparator. Solid vermilion.
+    if has_gt:
+        ax1.plot(omega_gt, A_gt, color=COLOR_DEAC, lw=1.2, alpha=0.95,
+                 label=gt_label)
+
+    # VAE — solid blue, the deterministic A(omega | <G(tau)>).
+    if vae is not None and vae.get("A_from_avg") is not None:
+        ax1.plot(vae["omega"], vae["A_from_avg"],
+                 color=COLOR_VAE, lw=1.2,
+                 label=r"VAE-AC $A(\omega\,|\,\langle G(\tau)\rangle)$")
+
+    # OmegaMaxEnt — dash-dot reddish-purple.
     if omegamaxent is not None:
         ax1.plot(omegamaxent["omega"], omegamaxent["A_opt"],
-                 color="tab:red", lw=1.8, ls="-.",
+                 color=COLOR_OMEGAMAXENT, lw=1.2, ls="-.",
                  label=r"MaxEnt (OmegaMaxEnt)")
 
     ax1.set_ylabel(r"$A(\omega)$")
     ax1.set_title(r"Spectral function $A(\omega)$: VAE vs MaxEnt", fontsize=12, pad=6)
-    ax1.legend(loc="upper right")
-    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="upper right", frameon=False)
+    _despine(ax1)
     if not has_gt:
         ax1.set_xlabel(r"$\omega$")
 
-    # Difference panel — only when ground truth is available
-    if has_gt:
-        ax2.axhline(0, color="gray", lw=0.8, alpha=0.5)
-        if vae is not None:
-            gt_interp = np.interp(vae["omega"], omega_gt, A_gt)
-            diff_v = vae["A_avg"] - gt_interp
-            ax2.plot(vae["omega"], diff_v, color="tab:blue", lw=1.2, label="VAE")
-            ax2.fill_between(vae["omega"], diff_v, alpha=0.20, color="tab:blue")
-            if vae.get("A_from_avg") is not None:
-                diff_va = vae["A_from_avg"] - gt_interp
-                ax2.plot(vae["omega"], diff_va, color="tab:purple", lw=1.2, ls=":",
-                         label=r"VAE $\langle G\rangle$")
-        if anacont is not None:
-            gt_interp_m = np.interp(anacont["omega"], omega_gt, A_gt)
-            diff_m = anacont["A_opt"] - gt_interp_m
-            ax2.plot(anacont["omega"], diff_m, color="tab:orange", lw=1.2, ls="--",
-                     label=r"ana\_cont")
-            ax2.fill_between(anacont["omega"], diff_m, alpha=0.20, color="tab:orange")
+    # Difference panel — residuals against MaxEnt (the comparison basis).
+    # Falls back to the in-file reference if MaxEnt is not loaded.
+    if anacont is not None:
+        omega_basis  = anacont["omega"]
+        A_basis      = anacont["A_opt"]
+        basis_label  = r"MaxEnt"
+        basis_is_gt  = False
+    elif has_gt:
+        omega_basis  = omega_gt
+        A_basis      = A_gt
+        basis_label  = gt_label
+        basis_is_gt  = True
+    else:
+        omega_basis = None
+
+    if omega_basis is not None:
+        ax2.axhline(0, color="#888888", lw=0.8, alpha=0.6)
+
+        def _residual_label(short, omega_m, diff):
+            L2   = float(np.sqrt(np.trapezoid(diff ** 2, omega_m)))
+            Linf = float(np.max(np.abs(diff)))
+            return rf"{short}: $L^2 = {L2:.3f}$, $L^\infty = {Linf:.3f}$"
+
+        # VAE − basis
+        if vae is not None and vae.get("A_from_avg") is not None:
+            diff_v = vae["A_from_avg"] - np.interp(vae["omega"], omega_basis, A_basis)
+            ax2.plot(vae["omega"], diff_v, color=COLOR_VAE, lw=1.0,
+                     label=_residual_label(r"VAE $\langle G\rangle$", vae["omega"], diff_v))
+            ax2.fill_between(vae["omega"], diff_v, alpha=0.12, color=COLOR_VAE)
+        # DEAC / external reference − basis (only when basis is MaxEnt, i.e.
+        # the reference is not itself the basis).
+        if has_gt and not basis_is_gt:
+            diff_d = A_gt - np.interp(omega_gt, omega_basis, A_basis)
+            ax2.plot(omega_gt, diff_d, color=COLOR_DEAC, lw=1.0,
+                     label=_residual_label(gt_label, omega_gt, diff_d))
+            ax2.fill_between(omega_gt, diff_d, alpha=0.12, color=COLOR_DEAC)
+        # OmegaMaxEnt − basis
         if omegamaxent is not None:
-            gt_interp_o = np.interp(omegamaxent["omega"], omega_gt, A_gt)
-            diff_o = omegamaxent["A_opt"] - gt_interp_o
-            ax2.plot(omegamaxent["omega"], diff_o, color="tab:red", lw=1.2, ls="-.",
-                     label="OmegaMaxEnt")
-            ax2.fill_between(omegamaxent["omega"], diff_o, alpha=0.20, color="tab:red")
-        ax2.legend(fontsize=9, loc="upper right")
-        ax2.set_ylabel(r"$\Delta A(\omega)$")
+            diff_o = omegamaxent["A_opt"] - np.interp(omegamaxent["omega"], omega_basis, A_basis)
+            ax2.plot(omegamaxent["omega"], diff_o, color=COLOR_OMEGAMAXENT, lw=1.0, ls="-.",
+                     label=_residual_label("OmegaMaxEnt", omegamaxent["omega"], diff_o))
+            ax2.fill_between(omegamaxent["omega"], diff_o, alpha=0.12, color=COLOR_OMEGAMAXENT)
+        # MaxEnt − basis when basis is GT (synthetic case): MaxEnt becomes a
+        # comparator instead of the basis. Do not plot MaxEnt vs itself.
+        if basis_is_gt and anacont is not None:
+            diff_m = anacont["A_opt"] - np.interp(anacont["omega"], omega_basis, A_basis)
+            ax2.plot(anacont["omega"], diff_m, color=COLOR_MAXENT, lw=1.0, ls="--",
+                     label=_residual_label(r"ana\_cont", anacont["omega"], diff_m))
+            ax2.fill_between(anacont["omega"], diff_m, alpha=0.12, color=COLOR_MAXENT)
+        ax2.legend(fontsize=9, loc="upper right", frameon=False)
+        ax2.set_ylabel(rf"$\Delta A(\omega)$ vs {basis_label}")
         ax2.set_xlabel(r"$\omega$")
-        ax2.grid(True, alpha=0.3)
+        _despine(ax2)
 
     if vae is not None and vae.get("params"):
         _build_loss_annotation(fig, vae["params"])
@@ -366,8 +428,11 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path, sim_n
 
 
 def plot_spectral_samples(vae, anacont, omegamaxent, omega_gt, A_gt,
-                          sample_indices, out_path):
-    """Per-sample A(omega) panels: VAE per sample vs MaxEnt mean."""
+                          sample_indices, out_path, gt_label="Ground truth"):
+    """Per-sample A(omega) panels: VAE per sample vs MaxEnt mean.
+
+    `gt_label` names the green reference curve (see plot_spectral_avg).
+    """
     n = len(sample_indices)
     fig = plt.figure(figsize=(9, 5 * n))
     outer = GridSpec(n, 1, figure=fig, hspace=0.55)
@@ -382,57 +447,64 @@ def plot_spectral_samples(vae, anacont, omegamaxent, omega_gt, A_gt,
         ax_main = fig.add_subplot(inner[0])
         ax_diff = fig.add_subplot(inner[1], sharex=ax_main)
 
+        # MaxEnt (basis) first so it sits underneath comparators — dashed.
+        if anacont is not None:
+            ax_main.plot(anacont["omega"], anacont["A_opt"],
+                         color=COLOR_MAXENT, lw=1.2, ls="--", alpha=0.95,
+                         label=r"MaxEnt (ana\_cont, mean)")
+
         if A_gt is not None:
-            ax_main.fill_between(omega_gt_use, A_gt, alpha=0.12, color="tab:green")
-            ax_main.plot(omega_gt_use, A_gt, color="tab:green", lw=1.5, alpha=0.9,
-                         label="Ground truth")
+            ax_main.plot(omega_gt_use, A_gt, color=COLOR_DEAC, lw=1.0, alpha=0.95,
+                         label=gt_label)
 
         if vae is not None and idx < vae["A_mean"].shape[0]:
             A_v   = vae["A_mean"][idx]
             omega_v = vae["omega"]
-            ax_main.plot(omega_v, A_v, color="tab:blue", lw=1.5,
+            ax_main.plot(omega_v, A_v, color=COLOR_VAE, lw=1.0,
                          label=rf"VAE sample {idx}")
-
-        if anacont is not None:
-            ax_main.plot(anacont["omega"], anacont["A_opt"],
-                         color="tab:orange", lw=1.5, ls="--",
-                         label=r"MaxEnt (ana\_cont, mean)")
 
         if omegamaxent is not None:
             ax_main.plot(omegamaxent["omega"], omegamaxent["A_opt"],
-                         color="tab:red", lw=1.5, ls="-.",
+                         color=COLOR_OMEGAMAXENT, lw=1.0, ls="-.",
                          label=r"MaxEnt (OmegaMaxEnt, mean)")
 
         ax_main.set_ylabel(r"$A(\omega)$")
         ax_main.set_title(rf"Sample {idx}", pad=4)
-        ax_main.legend(fontsize=9)
-        ax_main.grid(True, alpha=0.3)
+        ax_main.legend(fontsize=9, frameon=False)
+        _despine(ax_main)
         plt.setp(ax_main.get_xticklabels(), visible=False)
 
-        # Diff panel
-        ax_diff.axhline(0, color="gray", lw=0.8, alpha=0.5)
-        if A_gt is not None:
+        # Residual panel — vs MaxEnt (basis) when available; else vs reference.
+        if anacont is not None:
+            omega_basis_s, A_basis_s, basis_label_s = anacont["omega"], anacont["A_opt"], r"MaxEnt"
+            basis_is_gt_s = False
+        elif A_gt is not None:
+            omega_basis_s, A_basis_s, basis_label_s = omega_gt_use, A_gt, gt_label
+            basis_is_gt_s = True
+        else:
+            omega_basis_s = None
+
+        if omega_basis_s is not None:
+            ax_diff.axhline(0, color="#888888", lw=0.8, alpha=0.6)
             if vae is not None and idx < vae["A_mean"].shape[0]:
                 omega_v  = vae["omega"]
-                gt_i     = np.interp(omega_v, omega_gt_use, A_gt)
-                diff_v   = vae["A_mean"][idx] - gt_i
-                ax_diff.plot(omega_v, diff_v, color="tab:blue", lw=1.2)
-                ax_diff.fill_between(omega_v, diff_v, alpha=0.20, color="tab:blue")
-            if anacont is not None:
-                omega_m  = anacont["omega"]
-                gt_m     = np.interp(omega_m, omega_gt_use, A_gt)
-                diff_m   = anacont["A_opt"] - gt_m
-                ax_diff.plot(omega_m, diff_m, color="tab:orange", lw=1.2, ls="--")
-                ax_diff.fill_between(omega_m, diff_m, alpha=0.20, color="tab:orange")
-        ax_diff.set_ylabel(r"$\Delta A$", fontsize=9)
+                diff_v   = vae["A_mean"][idx] - np.interp(omega_v, omega_basis_s, A_basis_s)
+                ax_diff.plot(omega_v, diff_v, color=COLOR_VAE, lw=1.0)
+                ax_diff.fill_between(omega_v, diff_v, alpha=0.12, color=COLOR_VAE)
+            if A_gt is not None and not basis_is_gt_s:
+                diff_d = A_gt - np.interp(omega_gt_use, omega_basis_s, A_basis_s)
+                ax_diff.plot(omega_gt_use, diff_d, color=COLOR_DEAC, lw=1.0)
+                ax_diff.fill_between(omega_gt_use, diff_d, alpha=0.12, color=COLOR_DEAC)
+        ax_diff.set_ylabel(rf"$\Delta A$ vs {basis_label_s}" if omega_basis_s is not None else r"$\Delta A$",
+                           fontsize=9)
         ax_diff.set_xlabel(r"$\omega$")
-        ax_diff.grid(True, alpha=0.3)
+        _despine(ax_diff)
 
     fig.suptitle(
         r"\textbf{VAE} (blue, per sample) vs "
-        r"\textbf{MaxEnt} (orange/red, mean $G(\tau)$)"
+        r"\textbf{MaxEnt} (dark slate dashed, mean $G(\tau)$ — comparison basis)"
         "\n"
-        r"Ground truth: green shaded",
+        rf"{gt_label}: vermilion solid",
         fontsize=11,
     )
     fig.subplots_adjust(top=0.93)
@@ -455,17 +527,19 @@ def plot_gtau(vae, anacont, omegamaxent, sample_indices, out_path):
 
     for row, idx in enumerate(sample_indices):
         ax = axes[row, 0]
-        ax.plot(taus, vae["G_input"][idx], "k-", lw=1.5, label=r"$G(\tau)$ input")
-        ax.plot(taus, vae["G_recon"][idx], "b--", lw=1.2, label="VAE recon")
+        ax.plot(taus, vae["G_input"][idx], color=COLOR_GREEN_INPUT, lw=1.5,
+                label=r"$G(\tau)$ input")
+        ax.plot(taus, vae["G_recon"][idx], color=COLOR_VAE_RECON, lw=1.2, ls="--",
+                label="VAE recon")
         if anacont is not None:
             ax.plot(anacont["tau"],
                     anacont["backtransform"],
-                    color="tab:orange", lw=1.2, ls=":",
+                    color=COLOR_ANACONT_BACK, lw=1.2, ls=":",
                     label=r"MaxEnt (ana\_cont) back-transform")
         ax.set_ylabel(r"$G(\tau)$")
         ax.set_title(f"Sample {idx}")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, frameon=False)
+        _despine(ax)
 
     axes[-1, 0].set_xlabel(r"$\tau$")
     fig.suptitle(r"$G(\tau)$: input vs reconstructions", fontsize=12)
@@ -475,10 +549,13 @@ def plot_gtau(vae, anacont, omegamaxent, sample_indices, out_path):
     print(f"  Saved: {out_path}")
 
 
-def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
+def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir,
+                           gt_label="Ground truth"):
     """Compute and save comparison metrics to text and JSON.
 
-    L2 and L∞ errors are only computed and shown when ground truth is available.
+    L2 / L∞ errors use MaxEnt (ana_cont) as the comparison basis when it is
+    available; otherwise fall back to the in-file reference (DEAC / synthetic
+    ground truth). The basis label is recorded next to the L2/L∞ columns.
     """
     has_gt = A_gt is not None and omega_gt is not None
     rows = []
@@ -494,6 +571,22 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
                 vae["omega"], vae["A_mean"], vae["A_from_avg"]
             )
 
+    # Pick the comparison basis. MaxEnt is preferred; fall back to GT/DEAC.
+    if anacont is not None:
+        omega_basis = anacont["omega"]
+        A_basis     = anacont["A_opt"]
+        basis_label = "MaxEnt (ana_cont)"
+        basis_method_key = "MaxEnt ana_cont"
+    elif has_gt:
+        omega_basis = omega_gt
+        A_basis     = A_gt
+        basis_label = gt_label
+        basis_method_key = None
+    else:
+        omega_basis = None
+        basis_label = None
+        basis_method_key = None
+
     methods_spec = [
         ("VAE-AC (avg)",         vae,          "omega", "A_avg"),
         ("MaxEnt ana_cont",      anacont,      "omega", "A_opt"),
@@ -502,6 +595,11 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
     if vae is not None and vae.get("A_from_avg") is not None:
         methods_spec.insert(1,
             ("VAE-AC (from <G>)", vae,         "omega", "A_from_avg"))
+    # Add the in-file reference (DEAC / synthetic GT) as a comparator row when
+    # MaxEnt is the basis. Skipped when the reference *is* the basis.
+    if has_gt and basis_method_key is not None:
+        methods_spec.append((gt_label, {"omega": omega_gt, "A_opt": A_gt},
+                             "omega", "A_opt"))
 
     for label, method_data, omega_key, A_key in methods_spec:
         if method_data is None or method_data.get(A_key) is None:
@@ -520,10 +618,15 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
                 else None
             ),
         }
-        if has_gt:
-            gt_interp = np.interp(omega_m, omega_gt, A_gt)
-            row["L2_error"]   = round(l2_error(omega_m, A_m, gt_interp), 5)
-            row["Linf_error"] = round(linf_error(A_m, gt_interp), 5)
+        if omega_basis is not None:
+            if label == basis_method_key:
+                # Method is the basis — L2/L∞ are trivially zero.
+                row["L2_error"]   = 0.0
+                row["Linf_error"] = 0.0
+            else:
+                basis_interp = np.interp(omega_m, omega_basis, A_basis)
+                row["L2_error"]   = round(l2_error(omega_m, A_m, basis_interp), 5)
+                row["Linf_error"] = round(linf_error(A_m, basis_interp), 5)
         rows.append(row)
 
     # Print table
@@ -543,6 +646,8 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
                   f"{r['Linf_error']:>10.5f} {chi2_str:>8} {sc_str:>10}")
         else:
             print(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8} {sc_str:>10}")
+    if omega_basis is not None:
+        print(f"\n  L2 / Linf computed against: {basis_label}")
     if sc_val is not None:
         print(f"\n  SC = (1/N) sum_i  int |A_i(w) - A(w|<G>)|^2 dw   "
               f"[lower = more self-consistent]")
@@ -562,6 +667,8 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir):
                         f"{r['Linf_error']:>10.5f} {chi2_str:>8} {sc_str:>10}\n")
             else:
                 f.write(f"{r['method']:<30} {r['norm']:>8.4f} {chi2_str:>8} {sc_str:>10}\n")
+        if omega_basis is not None:
+            f.write(f"\nL2 / Linf computed against: {basis_label}\n")
         if sc_val is not None:
             f.write("\nSC = (1/N) sum_i  int |A_i(w) - A(w|<G>)|^2 dw   "
                     "[lower = more self-consistent]\n")
@@ -579,12 +686,28 @@ def plot_metrics_bar(rows, out_path):
     if not rows:
         return
 
+    # Drop the per-sample-mean VAE row from the bar chart — keep only the
+    # deterministic A(omega | <G(tau)>) representative for the VAE method.
+    rows = [r for r in rows if r["method"] != "VAE-AC (avg)"]
+    if not rows:
+        return
+
+    # Map method names to the canonical palette so a method always has the
+    # same color whether it shows up as a curve or a bar.
+    color_for = {
+        "VAE-AC (from <G>)":   COLOR_VAE,
+        "MaxEnt ana_cont":     COLOR_MAXENT,
+        "MaxEnt OmegaMaxEnt":  COLOR_OMEGAMAXENT,
+        "DEAC":                COLOR_DEAC,
+        "Ground truth":        COLOR_DEAC,
+    }
+
     has_gt = "L2_error" in rows[0]
     methods = [r["method"] for r in rows]
     norms   = [r["norm"]   for r in rows]
     n       = len(methods)
     x       = np.arange(n)
-    colors  = ["tab:blue", "tab:purple", "tab:orange", "tab:red", "tab:gray"][:n]
+    colors  = [color_for.get(m, "#888888") for m in methods]
 
     if has_gt:
         l2s   = [r["L2_error"]   for r in rows]
@@ -603,12 +726,12 @@ def plot_metrics_bar(rows, out_path):
         axes = [axes_raw]
 
     for ax, (values, ylabel, hline) in zip(axes, panels_def):
-        bars = ax.bar(x, values, color=colors, width=0.5, alpha=0.85,
-                      edgecolor="black", linewidth=0.7)
+        bars = ax.bar(x, values, color=colors, width=0.55, alpha=0.85,
+                      edgecolor="none")
         if hline is not None:
-            ax.axhline(hline, color="gray", lw=1.2, ls="--", alpha=0.7,
+            ax.axhline(hline, color="#888888", lw=1.0, ls="--", alpha=0.7,
                        label=f"ideal = {hline}")
-            ax.legend(fontsize=9)
+            ax.legend(fontsize=9, frameon=False)
         for bar, val in zip(bars, values):
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
@@ -619,7 +742,8 @@ def plot_metrics_bar(rows, out_path):
         ax.set_xticks(x)
         ax.set_xticklabels(methods, rotation=15, ha="right", fontsize=9)
         ax.set_ylabel(ylabel)
-        ax.grid(axis="y", alpha=0.3)
+        _despine(ax, grid=False)
+        ax.grid(axis="y", alpha=0.25, lw=0.6, ls=":", color="#999999")
         ymax = max(values) * 1.18
         ax.set_ylim(0, ymax if ymax > 0 else 1)
 
@@ -661,16 +785,34 @@ def main():
     # ------------------------------------------------------------------
     # Ground truth
     # ------------------------------------------------------------------
-    spec_path = None
-    if vae is not None:
-        spec_path = vae["spectral_input_path"]
-    elif anacont is not None:
-        spec_path = anacont["spectral_input_path"]
-    omega_gt, A_gt = load_ground_truth(spec_path)
-    if A_gt is not None:
-        print(f"Ground truth loaded: {len(A_gt)} omega points")
-    else:
-        print(f"WARNING: ground truth not found at {spec_path}")
+    # The reference curve (green) on each plot can come from one of two
+    # sources, with very different epistemic status:
+    #   1. In-summary `dos_ref`/`ws_ref` — currently this is the SmoQyDEAC
+    #      reconstruction shipped with the site-Holstein cube. NOT exact; it
+    #      is itself an analytic-continuation method. Label accordingly.
+    #   2. `spectral_input.csv` from a synthetic dataset — this IS the exact
+    #      A(omega) the synthetic Green's function was built from. Genuine
+    #      ground truth.
+    omega_gt, A_gt = None, None
+    gt_label = "Ground truth"
+    for src in (vae, anacont):
+        if src is not None and src.get("dos_ref") is not None and src.get("ws_ref") is not None:
+            omega_gt = np.asarray(src["ws_ref"])
+            A_gt     = np.asarray(src["dos_ref"])
+            gt_label = "DEAC"
+            print(f"Reference DOS from in-summary `dos_ref` (SmoQyDEAC): {len(A_gt)} omega points")
+            break
+    if A_gt is None:
+        spec_path = None
+        if vae is not None:
+            spec_path = vae["spectral_input_path"]
+        elif anacont is not None:
+            spec_path = anacont["spectral_input_path"]
+        omega_gt, A_gt = load_ground_truth(spec_path)
+        if A_gt is not None:
+            print(f"Ground truth loaded from {spec_path}: {len(A_gt)} omega points")
+        else:
+            print(f"WARNING: reference curve not found at {spec_path}")
 
     # ------------------------------------------------------------------
     # Plots
@@ -681,11 +823,13 @@ def main():
         vae, anacont, omegamaxent, omega_gt, A_gt,
         os.path.join(COMPARE_OUT_DIR, "spectral_avg.pdf"),
         sim_name=_sim_name,
+        gt_label=gt_label,
     )
     plot_spectral_samples(
         vae, anacont, omegamaxent, omega_gt, A_gt,
         SAMPLE_INDICES,
         os.path.join(COMPARE_OUT_DIR, "spectral_samples.pdf"),
+        gt_label=gt_label,
     )
     plot_gtau(
         vae, anacont, omegamaxent,
@@ -697,7 +841,10 @@ def main():
     # Metrics
     # ------------------------------------------------------------------
     print("\nComputing metrics...")
-    rows = print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, COMPARE_OUT_DIR)
+    rows = print_and_save_metrics(
+        vae, anacont, omegamaxent, omega_gt, A_gt, COMPARE_OUT_DIR,
+        gt_label=gt_label,
+    )
     plot_metrics_bar(
         rows,
         os.path.join(COMPARE_OUT_DIR, "metrics_bar.pdf"),
