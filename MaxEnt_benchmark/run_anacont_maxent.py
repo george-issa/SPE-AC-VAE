@@ -39,8 +39,8 @@ import ana_cont.continuation as cont  # type: ignore
 
 MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# --- Data source: "synthetic" or "real" ---
-DATA_SOURCE = "real"
+# --- Data source: "synthetic", "real", or "holstein_jld2" ---
+DATA_SOURCE = "holstein_jld2"
 
 # --------------------------------------------------------------------------
 # Real QMC data (DATA_SOURCE = "real")
@@ -50,6 +50,18 @@ QMC_SIM_DIR = os.path.join(
     MAIN_PATH, "Data", "datasets", "real",
     "hubbard_square_U8.00_mu0.00_L4_b6.00-1"
 )
+
+# --------------------------------------------------------------------------
+# Site-Holstein cube (DATA_SOURCE = "holstein_jld2")
+# Single .jld2 stores G(tau) and reference DOS for the (n, Omega, beta) grid.
+# Must match the cell selected in pretrain/run_finetune.py for a fair compare.
+# --------------------------------------------------------------------------
+HOLSTEIN_JLD2_PATH = os.path.join(
+    MAIN_PATH, "Data", "datasets", "real", "george_325.jld2"
+)
+HOLSTEIN_BETA  = 10.0   # in {5,6,...,20}
+HOLSTEIN_OMEGA = 1.0    # in {0.5, 1.0, 1.5, 2.0}
+HOLSTEIN_N     = 1.0    # in {0.05, 0.10, ..., 1.00}; n=1.0 is half-filling
 
 # --------------------------------------------------------------------------
 # Synthetic data (DATA_SOURCE = "synthetic")
@@ -111,6 +123,11 @@ if os.environ.get("SWEEP_PH_SYMMETRIZE"):
 # --- Output (set automatically from data source) ---
 if DATA_SOURCE == "real":
     _out_tag = f"anacont_real-{os.path.basename(QMC_SIM_DIR)}"
+elif DATA_SOURCE == "holstein_jld2":
+    _out_tag = (
+        f"anacont_real-site_holstein_b{HOLSTEIN_BETA:.2f}_w{HOLSTEIN_OMEGA:.2f}"
+        f"_n{HOLSTEIN_N:.2f}"
+    )
 else:
     _out_tag = f"anacont_{SPECTRAL_TYPE}_{INPUT_ID}_s{NOISE_S:.0e}"
 OUT_DIR = os.path.join(MAIN_PATH, "MaxEnt_benchmark", "out", _out_tag)
@@ -270,6 +287,40 @@ def main():
         L_tau = _params["L_tau"]
         spectral_input_path = None
         print(f"  beta={beta}, dtau={dtau}, L_tau={L_tau}")
+    elif DATA_SOURCE == "holstein_jld2":
+        from data_process_real import (  # type: ignore
+            _load_holstein_jld2, _ntau_holstein, _HOLSTEIN_DTAU,
+            _HOLSTEIN_BETAS, _HOLSTEIN_OMEGAS, _HOLSTEIN_NS,
+        )
+        print(f"Loading site-Holstein cube from: {HOLSTEIN_JLD2_PATH}")
+
+        def _idx(value, grid, label):
+            arr = np.asarray(grid, dtype=float)
+            i   = int(np.argmin(np.abs(arr - float(value))))
+            if abs(arr[i] - float(value)) > 1e-6:
+                raise ValueError(f"{label}={value} not in grid {grid}")
+            return i
+
+        b_idx = _idx(HOLSTEIN_BETA,  _HOLSTEIN_BETAS,  "HOLSTEIN_BETA")
+        w_idx = _idx(HOLSTEIN_OMEGA, _HOLSTEIN_OMEGAS, "HOLSTEIN_OMEGA")
+        n_idx = _idx(HOLSTEIN_N,     _HOLSTEIN_NS,     "HOLSTEIN_N")
+        print(f"  cell: beta={HOLSTEIN_BETA}, Omega={HOLSTEIN_OMEGA}, n={HOLSTEIN_N}  "
+              f"(idx beta={b_idx}, Omega={w_idx}, n={n_idx})")
+
+        G_r, dos_cube, ws_ref = _load_holstein_jld2(HOLSTEIN_JLD2_PATH)
+        # Slice the cube down to this cell so the saved npz carries a 1-D
+        # reference DOS rather than the full (n, Omega, beta, omega) tensor.
+        dos_ref = dos_cube[n_idx, w_idx, b_idx]   # (601,)
+        beta  = float(HOLSTEIN_BETA)
+        dtau  = float(_HOLSTEIN_DTAU)
+        L_tau = _ntau_holstein(beta)
+        # G_r is (n, Omega, beta, ntau, bins) after the loader's transpose.
+        G_bins = G_r[n_idx, w_idx, b_idx, :L_tau, :].T.copy()  # (N_bins, L_tau)
+        # We carry the in-file reference DOS through to the npz so the
+        # comparison plotter can use it as ground truth. There is no separate
+        # spectral-input CSV for this data source.
+        spectral_input_path = None
+        print(f"  beta={beta}, dtau={dtau}, L_tau={L_tau}")
     else:
         print(f"Loading synthetic data from: {DATA_PATH}")
         G_bins = load_data(DATA_PATH)
@@ -297,7 +348,16 @@ def main():
     # ------------------------------------------------------------------
     params = {
         "DATA_SOURCE":          DATA_SOURCE,
-        "DATA_PATH":            QMC_SIM_DIR if DATA_SOURCE == "real" else DATA_PATH,
+        "DATA_PATH":            (
+            QMC_SIM_DIR        if DATA_SOURCE == "real"          else
+            HOLSTEIN_JLD2_PATH if DATA_SOURCE == "holstein_jld2" else
+            DATA_PATH
+        ),
+        **({
+            "HOLSTEIN_BETA":  HOLSTEIN_BETA,
+            "HOLSTEIN_OMEGA": HOLSTEIN_OMEGA,
+            "HOLSTEIN_N":     HOLSTEIN_N,
+        } if DATA_SOURCE == "holstein_jld2" else {}),
         "SPECTRAL_INPUT_PATH":  spectral_input_path,
         "SPECTRAL_TYPE":        SPECTRAL_TYPE,
         "INPUT_ID":             INPUT_ID,
@@ -349,6 +409,9 @@ def main():
         print(f"  chi2 = {chi2:.4f},  ∫A dω = {norm:.4f}")
 
         out_name = "summary_mean_fullcov_phsym.npz" if PH_SYMMETRIZE else "summary_mean_fullcov.npz"
+        _holstein_extra = (
+            dict(dos_ref=dos_ref, ws_ref=ws_ref) if DATA_SOURCE == "holstein_jld2" else {}
+        )
         np.savez(
             os.path.join(OUT_DIR, out_name),
             omega=omega,
@@ -362,6 +425,7 @@ def main():
             cov_mean=cov_mean,
             spectral_input_path=spectral_input_path if spectral_input_path else "",
             ph_symmetrized=PH_SYMMETRIZE,
+            **_holstein_extra,
         )
         print(f"  Saved: {OUT_DIR}/{out_name}")
 

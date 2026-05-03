@@ -7,8 +7,8 @@ import h5py
 import numpy as np
 import os
 
-jld2_path = os.path.join("Data", "datasets", "george_325.jld2")
-h5_path   = os.path.join("Data", "datasets", "george_325_plain.h5")
+jld2_path = os.path.join("Data", "datasets", "real", "george_325.jld2")
+h5_path   = os.path.join("Data", "datasets", "real", "george_325_plain.h5")
 
 print("=" * 60)
 print(f"Loading: {jld2_path}")

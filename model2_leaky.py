@@ -72,7 +72,18 @@ class VariationalAutoEncoder2(nn.Module):
         self.norm3 = nn.InstanceNorm1d(64)
 
         # Encoder: fully connected (no bias) + leaky_relu
-        self.dense1 = nn.Linear(64 * (input_dim // 8), hidden_dim1, bias=False)
+        # Compute the conv stack's actual output length instead of assuming
+        # input_dim/8 — the Conv1d(kernel=9, stride=2, padding=4) produces
+        # ceil(in/2) per layer, which only equals in/2 when 2 | in. For
+        # input_dim divisible by 8 the result is the same as input_dim//8;
+        # for other lengths (e.g. 100 -> 13, not 12) the symbolic computation
+        # is required to avoid a flatten/Linear shape mismatch at runtime.
+        def _conv_out(L_in, kernel=9, stride=2, padding=4, dilation=1):
+            return (L_in + 2*padding - dilation*(kernel - 1) - 1) // stride + 1
+        _L1 = _conv_out(input_dim)
+        _L2 = _conv_out(_L1)
+        _L3 = _conv_out(_L2)
+        self.dense1 = nn.Linear(64 * _L3, hidden_dim1, bias=False)
         self.dense2 = nn.Linear(hidden_dim1, hidden_dim2, bias=False)
 
         # Latent space (no activation on mu/logvar — raw outputs)

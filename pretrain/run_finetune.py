@@ -57,17 +57,29 @@ from pretrain.synthetic_data import (  # type: ignore
 from data_process_real import (  # type: ignore
     SmoQyV2Dataset,
     load_covariance_v2,
+    extract_greens_bins_v2,
     read_model_params,
+    HolsteinJLD2Dataset,
+    load_covariance_from_holstein_jld2,
+    _load_holstein_jld2,
+    _HOLSTEIN_BETAS,
+    _HOLSTEIN_OMEGAS,
+    _HOLSTEIN_NS,
+    _HOLSTEIN_DTAU,
+    _ntau_holstein,
 )
 from pretrain.pretrain_losses import (  # type: ignore
     KLDivergenceLoss,
     ChiSquaredLoss,
+    Chi2FloorTransform,
+    Chi2OneSidedBarrier,
     SpectralSmoothnessLoss,
     SpectralPositivityLoss,
     NegativeGreenPenalty,
     NegativeSecondDerivativePenalty,
     NegativeFourthDerivativePenalty,
     finetune_total_loss,
+    ledoit_wolf_shrinkage,
     spectral_from_poles,
 )
 from pretrain.train_finetune import train_finetune  # type: ignore
@@ -82,26 +94,26 @@ from utils import MakeOutPath  # type: ignore
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAIN_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# --- Data source: "synthetic" or "real" ---
-DATA_SOURCE = "real"   # switch between synthetic CSV and real QMC JLD2
+# --- Data source: "synthetic", "real", or "holstein_jld2" ---
+DATA_SOURCE = "holstein_jld2"   # synthetic CSV, SmoQyDQMC v2 dir, or site-Holstein cube
 
 # --- Model ---
 LOAD_PRETRAIN = False
-NUM_POLES = 10
+NUM_POLES = 9
 N_NODES = 256
-BATCH_SIZE = 10
+BATCH_SIZE = 5
 
 # Latent bottleneck dim. None -> default (= 4*NUM_POLES - 2, legacy behaviour).
 # Set to an int to force a smaller latent (decoupled from num_poles); useful for
 # studying intrinsic-capacity / reproducibility experiments.
-LATENT_DIM = 2
+LATENT_DIM = 1
 
 # Particle-hole symmetry on the decoder. When True, NUM_POLES denotes the
 # *free* pole count; the model concatenates each free pole with its PH partner
 # (-eps, gamma, a, -b), so the spectral function is even (A(w)=A(-w)) and the
 # effective pole count is 2*NUM_POLES. The free count is what the network has
 # to predict; downstream wall-clock and parameter count track NUM_POLES.
-PH_SYMMETRIC = False
+PH_SYMMETRIC = False  # site-Holstein cell A(w) is not even — keep off for first run
 
 # Allow pretrain/run_finetune_sweep.py to override these without editing the file.
 NUM_POLES = int(os.environ.get("SWEEP_NUM_POLES", NUM_POLES))
@@ -109,6 +121,34 @@ if os.environ.get("SWEEP_LATENT_DIM"):
     LATENT_DIM = int(os.environ["SWEEP_LATENT_DIM"])
 if os.environ.get("SWEEP_PH_SYMMETRIC"):
     PH_SYMMETRIC = os.environ["SWEEP_PH_SYMMETRIC"].strip().lower() in ("1", "true", "yes")
+
+# --- chi^2 floor diagnostic (N1) ---
+# Covariance estimator for the whitening matrix in ChiSquaredLoss:
+#   "pca_truncated" (default) — drop low-eigenvalue directions at variance_threshold.
+#   "ledoit_wolf"             — shrinkage toward scaled identity; uses raw bins.
+# Loss mode controls whether chi^2 enters the gradient as-is or gets wrapped:
+#   "raw"             (default)        — pass-through.
+#   "warmup_floored"  — symmetric pseudo-Huber centred at 1 with warmup. Note:
+#       in practice this collapses the latent (chi^2 gradient flat near target).
+#   "barrier"         — one-sided ReLU^2 barrier below 1; raw chi^2 above 1.
+#       Equilibrium at chi^2* = 1 - 1/(2*BARRIER_LAMBDA).
+COVARIANCE_ESTIMATOR = "ledoit_wolf"
+# Cumulative-variance fraction kept by ChiSquaredLoss when
+# COVARIANCE_ESTIMATOR == "pca_truncated". Higher → more components retained.
+# On site-Holstein (b=10, w=1, n=1.0): 0.99 → 4/100 components, 0.999 → 7/100,
+# 0.9999 → 13/100. Ignored when COVARIANCE_ESTIMATOR == "ledoit_wolf".
+VARIANCE_THRESHOLD   = 0.999
+LOSS_MODE            = "raw"
+FLOOR_TARGET         = 1.0
+FLOOR_DELTA          = 0.1
+FLOOR_WARMUP_THRESH  = 5.0
+BARRIER_LAMBDA       = 50.0
+if os.environ.get("SWEEP_COVARIANCE_ESTIMATOR"):
+    COVARIANCE_ESTIMATOR = os.environ["SWEEP_COVARIANCE_ESTIMATOR"].strip()
+if os.environ.get("SWEEP_VARIANCE_THRESHOLD"):
+    VARIANCE_THRESHOLD = float(os.environ["SWEEP_VARIANCE_THRESHOLD"])
+if os.environ.get("SWEEP_LOSS_MODE"):
+    LOSS_MODE = os.environ["SWEEP_LOSS_MODE"].strip()
 
 # --------------------------------------------------------------------------
 # Synthetic data (DATA_SOURCE = "synthetic")
@@ -138,6 +178,24 @@ QMC_SIM_DIR = os.path.join(
 )
 
 # --------------------------------------------------------------------------
+# Site-Holstein cube (DATA_SOURCE = "holstein_jld2")
+# Single .jld2 stores G(tau) and reference DOS for the (n, Omega, beta) grid.
+# --------------------------------------------------------------------------
+HOLSTEIN_JLD2_PATH = os.path.join(
+    MAIN_PATH, "Data", "datasets", "real", "george_325.jld2"
+)
+HOLSTEIN_BETA  = 10.0   # in {5,6,...,20}
+HOLSTEIN_OMEGA = 1.0    # in {0.5, 1.0, 1.5, 2.0}
+HOLSTEIN_N     = 1.0    # in {0.05, 0.10, ..., 1.00}; n=1.0 is half-filling
+
+def _holstein_idx(value, grid, label):
+    arr = np.asarray(grid, dtype=float)
+    i   = int(np.argmin(np.abs(arr - float(value))))
+    if abs(arr[i] - float(value)) > 1e-6:
+        raise ValueError(f"{label}={value} not in grid {grid}")
+    return i
+
+# --------------------------------------------------------------------------
 # Shared physical parameters
 # --------------------------------------------------------------------------
 if DATA_SOURCE == "real":
@@ -145,6 +203,13 @@ if DATA_SOURCE == "real":
     BETA      = _qmc_params["beta"]
     DTAU      = _qmc_params["dtau"]
     INPUT_DIM = _qmc_params["L_tau"]   # authoritative — no floating-point precision issue
+elif DATA_SOURCE == "holstein_jld2":
+    BETA_IDX  = _holstein_idx(HOLSTEIN_BETA,  _HOLSTEIN_BETAS,  "HOLSTEIN_BETA")
+    OMEGA_IDX = _holstein_idx(HOLSTEIN_OMEGA, _HOLSTEIN_OMEGAS, "HOLSTEIN_OMEGA")
+    N_IDX     = _holstein_idx(HOLSTEIN_N,     _HOLSTEIN_NS,     "HOLSTEIN_N")
+    BETA      = float(HOLSTEIN_BETA)
+    DTAU      = float(_HOLSTEIN_DTAU)
+    INPUT_DIM = _ntau_holstein(BETA)
 else:
     BETA      = 10.0
     DTAU      = 0.05
@@ -158,7 +223,7 @@ PRETRAIN_DIR = os.path.join(
 PRETRAIN_CHECKPOINT = os.path.join(PRETRAIN_DIR, "model", "best_model_pretrain.pth")
 
 # --- Fine-tuning hyperparameters ---
-FINETUNE_EPOCHS = 200
+FINETUNE_EPOCHS = 3000
 FINETUNE_EPOCHS = int(os.environ.get("SWEEP_FINETUNE_EPOCHS", FINETUNE_EPOCHS))
 FINETUNE_LR = 1e-3
 FINETUNE_PATIENCE = FINETUNE_EPOCHS + 1              # Early stopping enabled with a wide window
@@ -253,18 +318,27 @@ def main():
     tag = "finetune"
 
     # --- Output directory ---
-    _out_label = (
-        f"real-{os.path.basename(QMC_SIM_DIR)}"
-        if DATA_SOURCE == "real"
-        else f"synthetic-{SPECTRAL_TYPE}_s{NOISE_S:.0e}_xi{NOISE_XI}"
-    )
+    if DATA_SOURCE == "real":
+        _out_label = f"real-{os.path.basename(QMC_SIM_DIR)}"
+    elif DATA_SOURCE == "holstein_jld2":
+        _out_label = (
+            f"real-site_holstein_b{HOLSTEIN_BETA:.2f}_w{HOLSTEIN_OMEGA:.2f}_n{HOLSTEIN_N:.2f}"
+        )
+    else:
+        _out_label = f"synthetic-{SPECTRAL_TYPE}_s{NOISE_S:.0e}_xi{NOISE_XI}"
     _init_tag  = "pretrained" if LOAD_PRETRAIN else "fresh"
     # Latent-bottleneck override gets a `_z{N}` suffix so runs are kept distinct
     # from default-latent_dim runs at the same num_poles. PH-symmetric runs get
     # a `_ph` suffix for the same reason — same NUM_POLES, different decoder.
     _z_tag     = f"_z{LATENT_DIM}" if LATENT_DIM is not None else ""
     _ph_tag    = "_ph" if PH_SYMMETRIC else ""
-    _base_name = f"finetune_{_out_label}_numpoles{NUM_POLES}{_ph_tag}{_z_tag}-{_init_tag}-{_model_tag}"
+    _cov_tag   = "_covlw" if COVARIANCE_ESTIMATOR == "ledoit_wolf" else ""
+    _loss_tag  = (
+        "_lossfloor"   if LOSS_MODE == "warmup_floored" else
+        "_lossbarrier" if LOSS_MODE == "barrier"        else
+        ""
+    )
+    _base_name = f"finetune_{_out_label}_numpoles{NUM_POLES}{_ph_tag}{_z_tag}{_cov_tag}{_loss_tag}-{_init_tag}-{_model_tag}"
     _out_root  = os.path.join(MAIN_PATH, "out")
     os.makedirs(_out_root, exist_ok=True)
     _used_ids  = [
@@ -277,19 +351,52 @@ def main():
     _next_id   = max(_used_ids, default=0) + 1
     sID        = f"{_init_tag}-{_model_tag}-{_next_id}"
     ft_out_dir = os.path.join(_out_root,
-                              f"finetune_{_out_label}_numpoles{NUM_POLES}{_ph_tag}{_z_tag}-{sID}")
+                              f"finetune_{_out_label}_numpoles{NUM_POLES}{_ph_tag}{_z_tag}{_cov_tag}{_loss_tag}-{sID}")
     print(f"Output directory: {ft_out_dir}")
     MakeOutPath(ft_out_dir)
 
     # --- Load full dataset — train on all samples, no held-out split ---
+    lw_rho = None  # captured into params.json when COVARIANCE_ESTIMATOR=="ledoit_wolf"
     if DATA_SOURCE == "real":
         print(f"Loading real QMC dataset from: {QMC_SIM_DIR}")
         ft_dataset = SmoQyV2Dataset(QMC_SIM_DIR, r1=0, r2=0)
         ft_dataset.summary()
-        C = load_covariance_v2(QMC_SIM_DIR, r1=0, r2=0)
+        if COVARIANCE_ESTIMATOR == "ledoit_wolf":
+            G_bins, _ = extract_greens_bins_v2(QMC_SIM_DIR, r1=0, r2=0)
+            C, lw_rho = ledoit_wolf_shrinkage(G_bins)
+            print(f"Ledoit-Wolf shrinkage: rho={lw_rho:.4f} (N_bins={G_bins.shape[0]}, "
+                  f"L_tau={G_bins.shape[1]})")
+        else:
+            C = load_covariance_v2(QMC_SIM_DIR, r1=0, r2=0)
+    elif DATA_SOURCE == "holstein_jld2":
+        print(f"Loading site-Holstein cube from: {HOLSTEIN_JLD2_PATH}")
+        print(f"  cell: beta={HOLSTEIN_BETA}, Omega={HOLSTEIN_OMEGA}, n={HOLSTEIN_N}  "
+              f"(idx beta={BETA_IDX}, Omega={OMEGA_IDX}, n={N_IDX})")
+        ft_dataset = HolsteinJLD2Dataset(
+            HOLSTEIN_JLD2_PATH,
+            n_idx=N_IDX, omega_idx=OMEGA_IDX, beta_idx=BETA_IDX,
+        )
+        ft_dataset.summary()
+        if COVARIANCE_ESTIMATOR == "ledoit_wolf":
+            G_r_full, _, _ = _load_holstein_jld2(HOLSTEIN_JLD2_PATH)
+            G_bins = G_r_full[N_IDX, OMEGA_IDX, BETA_IDX, :INPUT_DIM, :].T.copy()
+            C, lw_rho = ledoit_wolf_shrinkage(G_bins)
+            print(f"Ledoit-Wolf shrinkage: rho={lw_rho:.4f} (N_bins={G_bins.shape[0]}, "
+                  f"L_tau={G_bins.shape[1]})")
+        else:
+            C = load_covariance_from_holstein_jld2(
+                HOLSTEIN_JLD2_PATH,
+                n_idx=N_IDX, omega_idx=OMEGA_IDX, beta_idx=BETA_IDX,
+            )
     else:
         print(f"Loading synthetic dataset from: {SYNTHETIC_DATA_PATH}")
         ft_dataset = GreenFunctionDataset(file_path=SYNTHETIC_DATA_PATH)
+        if COVARIANCE_ESTIMATOR == "ledoit_wolf":
+            raise NotImplementedError(
+                "Ledoit-Wolf covariance estimator is currently only wired for "
+                "DATA_SOURCE='real'. The synthetic loader returns C directly, "
+                "not raw bins."
+            )
         C = load_covariance_from_dqmc(SYNTHETIC_DATA_PATH)
 
     N_samples = len(ft_dataset)
@@ -316,13 +423,25 @@ def main():
         "DTAU": DTAU,
         "BATCH_SIZE": BATCH_SIZE,
         "DATA_SOURCE": DATA_SOURCE,
-        **({} if DATA_SOURCE == "real" else {
+        **({
             "SPECTRAL_TYPE": SPECTRAL_TYPE,
             "NOISE_S": NOISE_S,
             "NOISE_XI": NOISE_XI,
             "INPUT_ID": INPUT_ID,
-        }),
-        "DATA_PATH": QMC_SIM_DIR if DATA_SOURCE == "real" else SYNTHETIC_DATA_PATH,
+        } if DATA_SOURCE == "synthetic" else {}),
+        **({
+            "HOLSTEIN_BETA":  HOLSTEIN_BETA,
+            "HOLSTEIN_OMEGA": HOLSTEIN_OMEGA,
+            "HOLSTEIN_N":     HOLSTEIN_N,
+            "HOLSTEIN_BETA_IDX":  BETA_IDX,
+            "HOLSTEIN_OMEGA_IDX": OMEGA_IDX,
+            "HOLSTEIN_N_IDX":     N_IDX,
+        } if DATA_SOURCE == "holstein_jld2" else {}),
+        "DATA_PATH": (
+            QMC_SIM_DIR        if DATA_SOURCE == "real"          else
+            HOLSTEIN_JLD2_PATH if DATA_SOURCE == "holstein_jld2" else
+            SYNTHETIC_DATA_PATH
+        ),
         "LOAD_PRETRAIN": LOAD_PRETRAIN,
         "FINETUNE_EPOCHS": FINETUNE_EPOCHS,
         "FINETUNE_LR": FINETUNE_LR,
@@ -343,6 +462,14 @@ def main():
         "SMOOTHNESS_WMIN": SMOOTHNESS_WMIN,
         "SMOOTHNESS_WMAX": SMOOTHNESS_WMAX,
         "SEED": SEED,
+        "COVARIANCE_ESTIMATOR": COVARIANCE_ESTIMATOR,
+        "VARIANCE_THRESHOLD":   VARIANCE_THRESHOLD,
+        "LW_RHO": lw_rho,
+        "LOSS_MODE": LOSS_MODE,
+        "FLOOR_TARGET": FLOOR_TARGET,
+        "FLOOR_DELTA": FLOOR_DELTA,
+        "FLOOR_WARMUP_THRESH": FLOOR_WARMUP_THRESH,
+        "BARRIER_LAMBDA": BARRIER_LAMBDA,
     }
     with open(f"{ft_out_dir}/params.json", "w") as _f:
         json.dump(params, _f, indent=2)
@@ -350,14 +477,40 @@ def main():
 
     # --- Load covariance and build loss modules ---
     print(f"Covariance shape: {C.shape}")
+    print(f"Covariance estimator: {COVARIANCE_ESTIMATOR}")
+    print(f"Loss mode: {LOSS_MODE}")
 
     kl_fn         = KLDivergenceLoss().to(DEVICE)
-    chi2_fn       = ChiSquaredLoss(C).to(DEVICE)
+    # Translate the user-facing estimator name to the whitening mode that
+    # ChiSquaredLoss expects. LW already shrinks C upstream, so the whitener
+    # runs without truncation; PCA truncation is the legacy/default path.
+    _whitening_mode = "full" if COVARIANCE_ESTIMATOR == "ledoit_wolf" else "pca_truncated"
+    chi2_fn       = ChiSquaredLoss(
+        C,
+        covariance_estimator=_whitening_mode,
+        variance_threshold=VARIANCE_THRESHOLD,
+    ).to(DEVICE)
     smoothness_fn = SpectralSmoothnessLoss(Nw=SMOOTHNESS_NW, wmin=SMOOTHNESS_WMIN, wmax=SMOOTHNESS_WMAX).to(DEVICE)
     positivity_fn = SpectralPositivityLoss().to(DEVICE)
     neg_green_fn  = NegativeGreenPenalty(C).to(DEVICE)
     neg_second_fn = NegativeSecondDerivativePenalty(C).to(DEVICE)
     neg_fourth_fn = NegativeFourthDerivativePenalty(C).to(DEVICE)
+
+    if LOSS_MODE == "warmup_floored":
+        chi2_transform = Chi2FloorTransform(
+            target=FLOOR_TARGET, delta=FLOOR_DELTA, warmup_threshold=FLOOR_WARMUP_THRESH,
+        ).to(DEVICE)
+    elif LOSS_MODE == "barrier":
+        chi2_transform = Chi2OneSidedBarrier(
+            lambda_=BARRIER_LAMBDA, target=FLOOR_TARGET,
+        ).to(DEVICE)
+        print(f"  Chi2OneSidedBarrier: lambda={BARRIER_LAMBDA}, target={FLOOR_TARGET}, "
+              f"equilibrium chi^2* = {FLOOR_TARGET - 1.0 / (2.0 * BARRIER_LAMBDA):.4f}")
+    elif LOSS_MODE == "raw":
+        chi2_transform = None
+    else:
+        raise ValueError(f"Unknown LOSS_MODE={LOSS_MODE!r}. "
+                         f"Expected 'raw', 'warmup_floored', or 'barrier'.")
 
     # --- Optimizer ---
     optimizer = optim.AdamW(model.parameters(), lr=FINETUNE_LR, weight_decay=0.0)
@@ -399,6 +552,7 @@ def main():
         tag=tag,
         patience=FINETUNE_PATIENCE,
         kl_anneal_epochs=FINETUNE_KL_ANNEAL_EPOCHS,
+        chi2_transform=chi2_transform,
     )
 
     chi2_losses   = np.load(f"{ft_out_dir}/losses/chi2_losses_{tag}.npy")
@@ -440,6 +594,7 @@ def main():
                 positivity_fn,
                 LAMBDA_CHI2, LAMBDA_SMOOTH, LAMBDA_POS, ALPHA_KL,
                 ETA0, ETA2, ETA4,
+                chi2_transform=chi2_transform,
             )
             eval_loss += loss.item() * B
 
@@ -529,6 +684,21 @@ def main():
         print(f"Active units: {n_active}/{latent_dim}  "
               f"(threshold Var[mu]>{AU_THRESHOLD:g})  KL_total={kl_total:.4e}")
 
+    if DATA_SOURCE == "holstein_jld2":
+        _sim_name = (
+            f"site_holstein_b{HOLSTEIN_BETA:.2f}_w{HOLSTEIN_OMEGA:.2f}_n{HOLSTEIN_N:.2f}"
+        )
+        _holstein_extra = {
+            "dos_ref": torch.tensor(ft_dataset.dos, dtype=torch.float64),
+            "ws_ref":  torch.tensor(ft_dataset.ws,  dtype=torch.float64),
+            "holstein_beta":  HOLSTEIN_BETA,
+            "holstein_omega": HOLSTEIN_OMEGA,
+            "holstein_n":     HOLSTEIN_N,
+        }
+    else:
+        _sim_name = os.path.basename(QMC_SIM_DIR) if DATA_SOURCE == "real" else None
+        _holstein_extra = {}
+
     torch.save({
         "inputs":       G_input_all,
         "recon":        G_recon_all,
@@ -543,10 +713,10 @@ def main():
         "recon_from_avg":    recon_from_avg,
         "beta":               BETA,
         "Ltau":               INPUT_DIM,
-        "spectral_input_path": None if DATA_SOURCE == "real" else SPECTRAL_INPUT_PATH,
+        "spectral_input_path": SPECTRAL_INPUT_PATH if DATA_SOURCE == "synthetic" else None,
         "noise_var":    float(np.mean(np.diag(np.array(C)))),
         "data_source":        DATA_SOURCE,
-        "sim_name":           os.path.basename(QMC_SIM_DIR) if DATA_SOURCE == "real" else None,
+        "sim_name":           _sim_name,
         "num_poles":          NUM_POLES,
         "sID":                sID,
         "best_chi2":          best_chi2,
@@ -561,6 +731,7 @@ def main():
         "self_consistency_linfty_per_sample": sc_linf_per_sample,
         "self_consistency_grid":             {"wmin": SC_WMIN, "wmax": SC_WMAX, "Nw": SC_NW},
         **au_data,
+        **_holstein_extra,
     }, f"{ft_out_dir}/summary.pt")
 
     print(f"Summary saved → {ft_out_dir}/summary.pt")
@@ -579,8 +750,14 @@ def main():
 
     poles_np = poles_all.mean(dim=0).numpy()
     res_np   = residues_all.mean(dim=0).numpy()
-    sim_label = (os.path.basename(QMC_SIM_DIR) if DATA_SOURCE == "real"
-                 else os.path.basename(os.path.dirname(SPECTRAL_INPUT_PATH)))
+    if DATA_SOURCE == "real":
+        sim_label = os.path.basename(QMC_SIM_DIR)
+    elif DATA_SOURCE == "holstein_jld2":
+        sim_label = (
+            f"site_holstein_b{HOLSTEIN_BETA:.2f}_w{HOLSTEIN_OMEGA:.2f}_n{HOLSTEIN_N:.2f}"
+        )
+    else:
+        sim_label = os.path.basename(os.path.dirname(SPECTRAL_INPUT_PATH))
     early_stop = n_epochs_run < FINETUNE_EPOCHS
 
     # Switch to ASCII box-drawing: every char is exactly 1 column wide,

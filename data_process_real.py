@@ -221,25 +221,37 @@ _HOLSTEIN_BETAS  = [float(b) for b in range(5, 21)]                            #
 
 
 def _ntau_holstein(beta):
-    """Number of valid tau points for a given beta (dtau=0.1)."""
-    return int(round(beta / _HOLSTEIN_DTAU)) + 1
+    """Number of tau slices for a given beta (dtau=0.1).
+
+    Excludes the tau=beta endpoint to match SmoQyDQMC's L_tau convention.
+    For beta=10 returns 100 (slices 0..99); the file stores 101 valid points
+    [0..beta] and the last one is dropped.
+    """
+    return int(round(beta / _HOLSTEIN_DTAU))
 
 
 def _load_holstein_jld2(jld2_path):
     """Load the Holstein JLD2 file and return the three arrays.
 
+    The file is written by Julia / JLD2 in column-major order, so h5py reads
+    each array with its axes reversed relative to Julia's view. We transpose
+    on read so the rest of this module can index by (n, Omega, beta, tau, bin)
+    — the natural physical order.
+
     Returns
     -------
-    G_r  : ndarray (20, 4, 16, 201, 100) — padded tau x bins
-    dos  : ndarray (20, 4, 16, 601)
+    G_r  : ndarray (20, 4, 16, 201, 100) — n x Omega x beta x ntau x bins
+    dos  : ndarray (20, 4, 16, 601)      — n x Omega x beta x omega
     ws   : ndarray (601,)
     """
     import h5py
 
     with h5py.File(jld2_path, "r") as f:
-        G_r = f["G_r"][()]    # (20, 4, 16, 201, 100)
-        dos = f["dos"][()]    # (20, 4, 16, 601)
-        ws  = f["ws"][()]     # (601,)
+        # h5py returns shapes (100, 201, 16, 4, 20) and (601, 16, 4, 20);
+        # transpose() reverses all axes to the documented physical order.
+        G_r = f["G_r"][()].transpose()
+        dos = f["dos"][()].transpose()
+        ws  = f["ws"][()]
     return G_r, dos, ws
 
 
