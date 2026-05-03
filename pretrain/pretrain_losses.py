@@ -127,39 +127,83 @@ class SpectralMSELoss(nn.Module):
 # ChiSquaredLoss
 # ---------------------------------------------------------------------------
 
+def ledoit_wolf_shrinkage(G_bins):
+    """Ledoit-Wolf shrinkage covariance with scaled-identity target.
+
+    C_LW = rho * mu * I + (1 - rho) * S, where S = (Xc^T Xc) / N is the ML
+    sample covariance, mu = tr(S)/p, and rho is the closed-form optimal
+    intensity (Ledoit & Wolf 2004 eqs. 14-15 with F = mu * I).
+
+    Pulls the tail eigenvalues away from zero, fixing the Marchenko-Pastur
+    blowup that prevents using the untruncated whitener directly.
+
+    Parameters
+    ----------
+    G_bins : ndarray (N, p), raw bins (centred internally)
+
+    Returns
+    -------
+    C_LW : ndarray (p, p)
+    rho  : float in [0, 1]
+    """
+    X = np.asarray(G_bins, dtype=np.float64)
+    N, p = X.shape
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = (Xc.T @ Xc) / N
+    mu = float(np.trace(S)) / p
+    F = mu * np.eye(p)
+
+    d_sq = float(np.sum((S - F) ** 2))
+
+    # b_bar^2 = (1/N^2) sum_n ||x_n x_n^T - S||_F^2
+    #         = (1/N^2) sum_n ||x_n||^4  -  (1/N) ||S||_F^2
+    x_norms_sq = np.sum(Xc ** 2, axis=1)
+    sum_x4     = float(np.sum(x_norms_sq ** 2))
+    S_fro_sq   = float(np.sum(S ** 2))
+    b_sq = sum_x4 / (N * N) - S_fro_sq / N
+    b_sq = min(max(b_sq, 0.0), d_sq)
+
+    rho = b_sq / d_sq if d_sq > 0 else 0.0
+    rho = float(min(max(rho, 0.0), 1.0))
+
+    C_LW = rho * F + (1.0 - rho) * S
+    return C_LW, rho
+
+
 class ChiSquaredLoss(nn.Module):
     """Chi-squared loss via whitening (inverse square root) of the covariance matrix.
 
     Matches the implementation in cohensbw/SPE-VAE-AC.  At perfect fit
     (G_recon → G_hat, dG = G_hat - G_tilde = -eta where eta ~ N(0, C)):
 
-        E[loss] = variance_threshold  ≈ 1
+        E[loss] ≈ 1
 
     so training loss converging to ~1 is the calibrated signal that the model
     is reconstructing the clean Green's function at the level of the DQMC noise.
 
-    Implementation
-    --------------
-    1. Eigendecompose C = V diag(w) V^T  (eigh, ascending order)
-    2. Clip w ≥ 0  (remove numerical negatives from finite-sample covariance)
-    3. Sort descending; keep the top n_components that explain
-       ≥ variance_threshold of total variance
-    4. Rescale retained eigenvalues to preserve Tr(C):
-           w_trunc ← w_trunc * sum(w) / sum(w_trunc)
-    5. Build the whitening matrix with the sqrt(Ltau/n_components) normalisation
-       factor that makes E[loss] = variance_threshold at perfect fit:
-           inv_sqrt_C = V_trunc diag(1/√w_trunc) V_trunc^T  *  √(Ltau/n_components)
-    6. Forward:
-           dG_white = dG @ inv_sqrt_C
-           loss = mean_batch( ||dG_white||² / Ltau )
+    Two whitening modes
+    -------------------
+    `covariance_estimator="pca_truncated"` (default — backwards compatible):
+       Sample C is poorly conditioned (Marchenko-Pastur regime), so keep only
+       the top eigendirections explaining `variance_threshold` of the trace.
+       The truncated pseudo-inverse-square-root is multiplied by
+       sqrt(Ltau/n_kept) so that E[loss] = 1 at perfect fit, independent of
+       the threshold (assumes residuals are well-aligned with the kept modes).
+
+    `covariance_estimator="full"`:
+       No truncation. Builds inv_sqrt_C from the full eigendecomposition.
+       Only safe when C has been regularised upstream (e.g. via Ledoit-Wolf
+       shrinkage); otherwise tiny tail eigenvalues blow up the whitener.
+       At perfect fit E[loss] = 1.
 
     Parameters
     ----------
-    C                  : ndarray (L_tau, L_tau), DQMC covariance matrix
-    variance_threshold : float, fraction of total variance retained (default 0.999)
+    C                    : ndarray (L_tau, L_tau), covariance matrix
+    covariance_estimator : "pca_truncated" | "full"
+    variance_threshold   : float, fraction of variance retained (PCA mode only)
     """
 
-    def __init__(self, C, variance_threshold=0.99):
+    def __init__(self, C, covariance_estimator="pca_truncated", variance_threshold=0.99):
         super().__init__()
 
         C_np = np.array(C, dtype=np.float64)
@@ -167,31 +211,45 @@ class ChiSquaredLoss(nn.Module):
 
         w, V = np.linalg.eigh(C_np)
         w = np.maximum(w, 0.0)
-        sum_w = float(np.sum(w))
 
-        idx = np.argsort(w)[::-1]
-        w_sorted = w[idx]
-        V_sorted = V[:, idx]
+        if covariance_estimator == "pca_truncated":
+            idx = np.argsort(w)[::-1]
+            w_sorted = w[idx]
+            V_sorted = V[:, idx]
 
-        cumsum = np.cumsum(w_sorted)
-        n_components = int(np.searchsorted(cumsum, variance_threshold * cumsum[-1]) + 1)
-        n_components = min(n_components, Ltau)
+            cumsum = np.cumsum(w_sorted)
+            n_components = int(np.searchsorted(cumsum, variance_threshold * cumsum[-1]) + 1)
+            n_components = min(n_components, Ltau)
 
-        w_trunc = w_sorted[:n_components].copy()
-        V_trunc = V_sorted[:, :n_components].copy()
-        w_trunc *= sum_w / float(np.sum(w_trunc))
+            w_trunc = w_sorted[:n_components]
+            V_trunc = V_sorted[:, :n_components]
 
-        eps = 1e-12
-        inv_sqrt_C = (
-            V_trunc @ np.diag(1.0 / np.sqrt(w_trunc + eps)) @ V_trunc.T
-            * np.sqrt(Ltau / n_components)
-        )
+            eps = 1e-12
+            inv_sqrt_C = (
+                V_trunc @ np.diag(1.0 / np.sqrt(w_trunc + eps)) @ V_trunc.T
+                * np.sqrt(Ltau / n_components)
+            )
+            print(f"  ChiSquaredLoss (pca_truncated): {n_components}/{Ltau} components kept "
+                  f"({100 * variance_threshold:.1f}% variance threshold), "
+                  f"E[loss] → 1.0 at perfect fit")
+        elif covariance_estimator == "full":
+            eps = 1e-12
+            n_components = Ltau
+            inv_sqrt_C = V @ np.diag(1.0 / np.sqrt(w + eps)) @ V.T
+            w_min = float(w.min())
+            cond = float(w.max() / max(w_min, eps))
+            print(f"  ChiSquaredLoss (full): no truncation, eigenvalue range "
+                  f"[{w_min:.3e}, {float(w.max()):.3e}] (cond ≈ {cond:.2e}), "
+                  f"E[loss] → 1.0 at perfect fit")
+        else:
+            raise ValueError(
+                f"Unknown covariance_estimator={covariance_estimator!r}. "
+                f"Expected 'pca_truncated' or 'full'."
+            )
 
         self.Ltau = Ltau
         self.n_components = n_components
-        print(f"  ChiSquaredLoss: {n_components}/{Ltau} components kept "
-              f"({100 * variance_threshold:.1f}% variance threshold), "
-              f"E[loss] → {variance_threshold:.4f} at perfect fit")
+        self.covariance_estimator = covariance_estimator
         self.register_buffer("inv_sqrt_C", torch.tensor(inv_sqrt_C, dtype=torch.float32))
 
     def forward(self, G_pred, G_input):
@@ -199,6 +257,93 @@ class ChiSquaredLoss(nn.Module):
         dG_white = dG @ self.inv_sqrt_C
         loss = torch.mean(torch.sum(dG_white ** 2, dim=1) / self.Ltau)
         return loss
+
+
+class Chi2FloorTransform(nn.Module):
+    """Smooth-target ('floored') wrapper around the chi^2 scalar.
+
+    Pass-through during warmup. Once an epoch's mean chi^2 first drops below
+    `warmup_threshold`, irrevocably switches to a pseudo-Huber penalty
+    centred at `target` (= 1.0):
+
+        L(chi^2) = sqrt((chi^2 - target)^2 + delta^2) - delta
+
+    Zero at target, |chi^2 - target| far from it, quadratic within +/- delta.
+    Crucially the gradient pushes chi^2 *up* toward 1 when chi^2 < 1 — the
+    diagnostic point of this wrapper for the chi^2 < 1 anomaly.
+
+    Stateful: the trainer must call `notify_epoch_end(epoch_chi2_mean)` once
+    per epoch with the raw (untransformed) chi^2 mean. The switch is one-way.
+
+    The transform applies only to the value entering the gradient; raw chi^2
+    is still returned by ChiSquaredLoss for logging and for the threshold test.
+    """
+
+    def __init__(self, target=1.0, delta=0.1, warmup_threshold=5.0):
+        super().__init__()
+        self.target = float(target)
+        self.delta = float(delta)
+        self.warmup_threshold = float(warmup_threshold)
+        self.register_buffer("warmed_up",    torch.tensor(False))
+        self.register_buffer("switch_epoch", torch.tensor(-1, dtype=torch.long))
+        self.register_buffer("epoch_count",  torch.tensor(0,  dtype=torch.long))
+
+    def forward(self, chi2):
+        if not bool(self.warmed_up.item()):
+            return chi2
+        d = self.delta
+        return torch.sqrt((chi2 - self.target) ** 2 + d * d) - d
+
+    def notify_epoch_end(self, epoch_chi2_mean):
+        self.epoch_count += 1
+        if bool(self.warmed_up.item()):
+            return
+        if float(epoch_chi2_mean) < self.warmup_threshold:
+            self.warmed_up.fill_(True)
+            self.switch_epoch.fill_(int(self.epoch_count.item()))
+            print(f"  Chi2FloorTransform: warmup complete at epoch {int(self.switch_epoch.item())} "
+                  f"(epoch chi^2 = {float(epoch_chi2_mean):.4f} < {self.warmup_threshold}); "
+                  f"switching to floored loss with target={self.target}, delta={self.delta}")
+
+
+class Chi2OneSidedBarrier(nn.Module):
+    """One-sided barrier on chi^2 < 1; raw chi^2 above target.
+
+        L(chi^2) = chi^2 + lambda * ReLU(target - chi^2)^2
+
+    Above target the barrier is exactly zero, so the model sees the raw chi^2
+    gradient and continues pulling chi^2 down toward the noise floor. Below
+    target the barrier ramps up and adds a restoring force.
+
+    Equilibrium (where dL/d(chi^2) = 0): chi^2* = target - 1/(2 * lambda_).
+    Pick lambda_ large enough that chi^2* sits arbitrarily close to target:
+        lambda_ = 10  -> chi^2* = target - 0.05
+        lambda_ = 50  -> chi^2* = target - 0.01
+        lambda_ = 500 -> chi^2* = target - 0.001
+
+    Crucially, unlike the symmetric pseudo-Huber floor, the chi^2 gradient is
+    nowhere flat — it stays at +1 above target and only drops as the barrier
+    catches up below target. The other loss components cannot dominate near
+    the target because chi^2 is still actively being minimised there.
+
+    No warmup needed: at large chi^2 the barrier is identically zero, so the
+    transform reduces to chi^2 itself during the descent phase.
+
+    Stateless. notify_epoch_end is a no-op so the trainer's per-epoch hook
+    can call it uniformly across transforms.
+    """
+
+    def __init__(self, lambda_=50.0, target=1.0):
+        super().__init__()
+        self.lambda_ = float(lambda_)
+        self.target = float(target)
+
+    def forward(self, chi2):
+        below = torch.relu(self.target - chi2)
+        return chi2 + self.lambda_ * below * below
+
+    def notify_epoch_end(self, epoch_chi2_mean):
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +646,7 @@ def finetune_total_loss(
     eta0=0.0,
     eta2=0.0,
     eta4=0.0,
+    chi2_transform=None,
 ):
     """Combine all fine-tuning losses.
 
@@ -545,8 +691,13 @@ def finetune_total_loss(
     else:
         pos_val = torch.tensor(0.0, device=G_recon.device)
 
+    # chi2_transform reshapes only the gradient-side chi^2; chi2_val (raw) is
+    # what we return for logging and what the trainer feeds back as the
+    # warmup-threshold signal.
+    chi2_for_total = chi2_transform(chi2_val) if chi2_transform is not None else chi2_val
+
     total = (
-        lambda_chi2  * chi2_val
+        lambda_chi2  * chi2_for_total
         + lambda_smooth * smooth_val
         + lambda_pos    * pos_val
         + alpha_kl      * kl_val

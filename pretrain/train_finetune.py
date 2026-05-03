@@ -53,6 +53,7 @@ def train_finetune(
     deterministic=False,
     grad_clip_norm=5.0,
     kl_anneal_epochs=50,
+    chi2_transform=None,
 ):
     """Train the VAE with unsupervised losses on DQMC Green's function data.
 
@@ -142,6 +143,7 @@ def train_finetune(
                 positivity_fn,
                 lambda_chi2, lambda_smooth, lambda_pos, kl_weight,
                 eta0, eta2, eta4,
+                chi2_transform=chi2_transform,
             )
 
             optimizer.zero_grad()
@@ -203,6 +205,9 @@ def train_finetune(
         neg_second_losses.append(epoch_neg_second/ n_samples)
         neg_fourth_losses.append(epoch_neg_fourth/ n_samples)
 
+        if chi2_transform is not None:
+            chi2_transform.notify_epoch_end(chi2_losses[-1])
+
         # ----- Validation (eval mode on val_loader = train_loader) -----
         model.eval()
         val_loss = 0.0
@@ -228,6 +233,7 @@ def train_finetune(
                     positivity_fn,
                     lambda_chi2, lambda_smooth, lambda_pos, alpha_kl,
                     eta0, eta2, eta4,
+                    chi2_transform=chi2_transform,
                 )
 
                 val_loss += loss.item() * B
