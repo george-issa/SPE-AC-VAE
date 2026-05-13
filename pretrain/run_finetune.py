@@ -262,6 +262,8 @@ AU_THRESHOLD = 1e-2
 
 # Reproducibility — set to an integer (e.g. 42) for deterministic runs, or None to disable
 SEED = None
+if os.environ.get("SWEEP_SEED") not in (None, "", "None", "none"):
+    SEED = int(os.environ["SWEEP_SEED"])
 
 # Set False on the cluster — all plotting stays on the local machine
 DO_PLOT = True

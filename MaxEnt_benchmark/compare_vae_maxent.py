@@ -147,6 +147,12 @@ def load_vae(summary_path):
         with open(params_path) as _f:
             params = json.load(_f)
 
+    # Architecture: "VAE" (the original encoder+decoder model) or "DecoderOnly"
+    # (no encoder, no latent space). Used downstream to label curves and
+    # metrics rows correctly — DecoderOnly runs should not be presented as
+    # "VAE-AC" since the V (variational) and AE (autoencoder) parts are gone.
+    arch = s.get("architecture") or params.get("ARCHITECTURE") or "VAE"
+
     return {
         "omega":               omega,
         "A_mean":              A_mean,
@@ -163,9 +169,30 @@ def load_vae(summary_path):
         "dos_ref":             (s["dos_ref"].numpy() if "dos_ref" in s else None),
         "ws_ref":              (s["ws_ref"].numpy()  if "ws_ref"  in s else None),
         "params":              params,
+        "architecture":        str(arch),
         "self_consistency":    (float(s["self_consistency"])
                                 if "self_consistency" in s else None),
     }
+
+
+# Labels for the trained model in plots/tables. DecoderOnly drops the
+# `A(omega | <G(tau)>)` conditioning notation because per-sample inference
+# is structurally absent (every G_i produces the same A).
+def _vae_curve_label(vae):
+    arch = (vae.get("architecture") if vae else None) or "VAE"
+    if arch == "DecoderOnly":
+        return r"DecoderOnly $A(\omega)$"
+    return r"VAE-AC $A(\omega\,|\,\langle G(\tau)\rangle)$"
+
+
+def _vae_short_label(vae):
+    arch = (vae.get("architecture") if vae else None) or "VAE"
+    return "DecoderOnly" if arch == "DecoderOnly" else r"VAE $\langle G\rangle$"
+
+
+def _vae_metrics_prefix(vae):
+    arch = (vae.get("architecture") if vae else None) or "VAE"
+    return "DecoderOnly" if arch == "DecoderOnly" else "VAE-AC"
 
 
 def load_anacont(npz_path):
@@ -330,7 +357,8 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path,
     if model_title:
         num_poles = vae["num_poles"] if vae is not None else None
         if num_poles is not None:
-            model_title += rf"~~$|$~~{num_poles} poles (VAE)"
+            arch = (vae.get("architecture") if vae else None) or "VAE"
+            model_title += rf"~~$|$~~{num_poles} poles ({arch})"
         fig.suptitle(model_title, fontsize=13, y=1.01)
 
     # MaxEnt (ana_cont) is the comparison basis — dashed, dark slate, lw=1.4.
@@ -345,11 +373,12 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path,
         ax1.plot(omega_gt, A_gt, color=COLOR_DEAC, lw=1.2, alpha=0.95,
                  label=gt_label)
 
-    # VAE — solid blue, the deterministic A(omega | <G(tau)>).
+    # Trained model — solid blue, the deterministic A(omega | <G(tau)>) for
+    # the VAE, or just A(omega) for DecoderOnly (the conditioning is moot).
     if vae is not None and vae.get("A_from_avg") is not None:
         ax1.plot(vae["omega"], vae["A_from_avg"],
                  color=COLOR_VAE, lw=1.2,
-                 label=r"VAE-AC $A(\omega\,|\,\langle G(\tau)\rangle)$")
+                 label=_vae_curve_label(vae))
 
     # OmegaMaxEnt — dash-dot reddish-purple.
     if omegamaxent is not None:
@@ -358,7 +387,9 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path,
                  label=r"MaxEnt (OmegaMaxEnt)")
 
     ax1.set_ylabel(r"$A(\omega)$")
-    ax1.set_title(r"Spectral function $A(\omega)$: VAE vs MaxEnt", fontsize=12, pad=6)
+    arch_for_title = (vae.get("architecture") if vae else None) or "VAE"
+    ax1.set_title(rf"Spectral function $A(\omega)$: {arch_for_title} vs MaxEnt",
+                  fontsize=12, pad=6)
     ax1.legend(loc="upper right", frameon=False)
     _despine(ax1)
     if not has_gt:
@@ -387,11 +418,11 @@ def plot_spectral_avg(vae, anacont, omegamaxent, omega_gt, A_gt, out_path,
             Linf = float(np.max(np.abs(diff)))
             return rf"{short}: $L^2 = {L2:.3f}$, $L^\infty = {Linf:.3f}$"
 
-        # VAE − basis
+        # Trained model − basis
         if vae is not None and vae.get("A_from_avg") is not None:
             diff_v = vae["A_from_avg"] - np.interp(vae["omega"], omega_basis, A_basis)
             ax2.plot(vae["omega"], diff_v, color=COLOR_VAE, lw=1.0,
-                     label=_residual_label(r"VAE $\langle G\rangle$", vae["omega"], diff_v))
+                     label=_residual_label(_vae_short_label(vae), vae["omega"], diff_v))
             ax2.fill_between(vae["omega"], diff_v, alpha=0.12, color=COLOR_VAE)
         # DEAC / external reference − basis (only when basis is MaxEnt, i.e.
         # the reference is not itself the basis).
@@ -587,14 +618,15 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir,
         basis_label = None
         basis_method_key = None
 
+    _vae_prefix = _vae_metrics_prefix(vae)   # "VAE-AC" or "DecoderOnly"
     methods_spec = [
-        ("VAE-AC (avg)",         vae,          "omega", "A_avg"),
-        ("MaxEnt ana_cont",      anacont,      "omega", "A_opt"),
-        ("MaxEnt OmegaMaxEnt",   omegamaxent,  "omega", "A_opt"),
+        (f"{_vae_prefix} (avg)",  vae,          "omega", "A_avg"),
+        ("MaxEnt ana_cont",       anacont,      "omega", "A_opt"),
+        ("MaxEnt OmegaMaxEnt",    omegamaxent,  "omega", "A_opt"),
     ]
     if vae is not None and vae.get("A_from_avg") is not None:
         methods_spec.insert(1,
-            ("VAE-AC (from <G>)", vae,         "omega", "A_from_avg"))
+            (f"{_vae_prefix} (from <G>)", vae,   "omega", "A_from_avg"))
     # Add the in-file reference (DEAC / synthetic GT) as a comparator row when
     # MaxEnt is the basis. Skipped when the reference *is* the basis.
     if has_gt and basis_method_key is not None:
@@ -614,7 +646,7 @@ def print_and_save_metrics(vae, anacont, omegamaxent, omega_gt, A_gt, out_dir,
             "norm":   round(norm, 4),
             "chi2":   round(chi2_val, 5) if not np.isnan(chi2_val) else None,
             "self_consistency": (
-                round(sc_val, 6) if (label == "VAE-AC (avg)" and sc_val is not None)
+                round(sc_val, 6) if (label == f"{_vae_prefix} (avg)" and sc_val is not None)
                 else None
             ),
         }
@@ -686,17 +718,21 @@ def plot_metrics_bar(rows, out_path):
     if not rows:
         return
 
-    # Drop the per-sample-mean VAE row from the bar chart — keep only the
-    # deterministic A(omega | <G(tau)>) representative for the VAE method.
-    rows = [r for r in rows if r["method"] != "VAE-AC (avg)"]
+    # Drop the per-sample-mean trained-model row from the bar chart — keep
+    # only the deterministic single-forward representative. Matches both
+    # "VAE-AC (avg)" and "DecoderOnly (avg)".
+    rows = [r for r in rows if not r["method"].endswith(" (avg)")]
     if not rows:
         return
 
     # Map method names to the canonical palette so a method always has the
-    # same color whether it shows up as a curve or a bar.
+    # same color whether it shows up as a curve or a bar. Trained-model row
+    # uses COLOR_VAE regardless of architecture (the visual identity is
+    # "the model we trained" — the label disambiguates the architecture).
     color_for = {
-        "VAE-AC (from <G>)":   COLOR_VAE,
-        "MaxEnt ana_cont":     COLOR_MAXENT,
+        "VAE-AC (from <G>)":      COLOR_VAE,
+        "DecoderOnly (from <G>)": COLOR_VAE,
+        "MaxEnt ana_cont":        COLOR_MAXENT,
         "MaxEnt OmegaMaxEnt":  COLOR_OMEGAMAXENT,
         "DEAC":                COLOR_DEAC,
         "Ground truth":        COLOR_DEAC,

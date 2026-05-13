@@ -120,6 +120,16 @@ PH_SYMMETRIZE = False
 if os.environ.get("SWEEP_PH_SYMMETRIZE"):
     PH_SYMMETRIZE = os.environ["SWEEP_PH_SYMMETRIZE"].strip().lower() in ("1", "true", "yes")
 
+# Multi-cell driver hooks: override the Holstein cube cell from the parent
+# environment so a script can sweep (beta, Omega, n) without edits.
+# Applied before _out_tag is built so the output dir reflects the cell.
+if os.environ.get("SWEEP_HOLSTEIN_BETA"):
+    HOLSTEIN_BETA = float(os.environ["SWEEP_HOLSTEIN_BETA"])
+if os.environ.get("SWEEP_HOLSTEIN_OMEGA"):
+    HOLSTEIN_OMEGA = float(os.environ["SWEEP_HOLSTEIN_OMEGA"])
+if os.environ.get("SWEEP_HOLSTEIN_N"):
+    HOLSTEIN_N = float(os.environ["SWEEP_HOLSTEIN_N"])
+
 # --- Output (set automatically from data source) ---
 if DATA_SOURCE == "real":
     _out_tag = f"anacont_real-{os.path.basename(QMC_SIM_DIR)}"
